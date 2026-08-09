@@ -1,4 +1,4 @@
-#File Info: name = wifi_dialog.py
+#File Info: name = adb_wifi_dialog.py
 
 import threading
 import tkinter as tk
@@ -12,12 +12,15 @@ from adb_wifi import (
     wait_for_pairing_service, wait_for_connect_service,
 )
 
+CONNECTED_COLOR = "#2ecc71"
+DEFAULT_COLOR = "gray"
+
 
 class WifiPairDialog(tk.Toplevel):
     def __init__(self, parent, on_paired=None):
         super().__init__(parent)
         self.title("Pair over WiFi")
-        self.geometry("360x420")
+        self.geometry("360x440")
         self.resizable(False, False)
         self.on_paired = on_paired
         self._pairing_started = False
@@ -38,11 +41,15 @@ class WifiPairDialog(tk.Toplevel):
     def _build_qr_tab(self):
         self.qr_label = ttk.Label(self.qr_tab)
         self.qr_label.pack(pady=10)
-        self.qr_status = tk.StringVar(
+
+        self.qr_status_var = tk.StringVar(
             value="Open Wireless debugging > Pair with QR code on your phone"
         )
-        ttk.Label(self.qr_tab, textvariable=self.qr_status, wraplength=320,
-                  foreground="gray").pack(pady=5)
+        self.qr_status_label = ttk.Label(
+            self.qr_tab, textvariable=self.qr_status_var, wraplength=320,
+            foreground=DEFAULT_COLOR
+        )
+        self.qr_status_label.pack(pady=5)
 
     def _start_qr_pairing(self):
         if self._pairing_started:
@@ -66,7 +73,9 @@ class WifiPairDialog(tk.Toplevel):
 
     def _on_qr_pairing_found(self, host, port):
         if host is None:
-            self.after(0, lambda: self.qr_status.set("No scan detected, try again."))
+            self.after(0, lambda: self._set_status(self.qr_status_label,
+                                                     self.qr_status_var,
+                                                     "No scan detected, try again."))
             return
         # for QR pairing adb uses the service name itself as the pairing code
         ok, output = run_adb("pair", f"{host}:{port}", self._service_name)
@@ -85,9 +94,13 @@ class WifiPairDialog(tk.Toplevel):
         ttk.Entry(frm, textvariable=self.pin_code_var).pack(fill="x", pady=5)
 
         ttk.Button(frm, text="Pair", command=self._pair_with_pin).pack(pady=10)
-        self.pin_status = tk.StringVar()
-        ttk.Label(frm, textvariable=self.pin_status, foreground="gray",
-                  wraplength=320).pack()
+
+        self.pin_status_var = tk.StringVar()
+        self.pin_status_label = ttk.Label(
+            frm, textvariable=self.pin_status_var, foreground=DEFAULT_COLOR,
+            wraplength=320
+        )
+        self.pin_status_label.pack()
 
     def _pair_with_pin(self):
         addr = self.pin_addr_var.get().strip()
@@ -95,23 +108,31 @@ class WifiPairDialog(tk.Toplevel):
         if not addr or not code:
             messagebox.showwarning("Missing info", "Enter both the address and the code.")
             return
-        self.pin_status.set("Pairing...")
+        self._set_status(self.pin_status_label, self.pin_status_var, "Pairing...")
         threading.Thread(target=self._pin_worker, args=(addr, code), daemon=True).start()
 
     def _pin_worker(self, addr, code):
         ok, output = run_adb("pair", addr, code)
         self.after(0, lambda: self._finish_pairing(ok, output))
 
+    def _set_status(self, label, var, text, color=DEFAULT_COLOR, big=False):
+        var.set(text)
+        label.configure(
+            foreground=color,
+            font=("TkDefaultFont", 14, "bold") if big else ("TkDefaultFont", 9, "normal"),
+        )
+
     def _finish_pairing(self, ok, output):
         if not ok:
             messagebox.showerror("Pairing failed", output)
-            self.qr_status.set("Pairing failed, try again.")
-            self.pin_status.set("Pairing failed, try again.")
+            self._set_status(self.qr_status_label, self.qr_status_var, "Pairing failed, try again.")
+            self._set_status(self.pin_status_label, self.pin_status_var, "Pairing failed, try again.")
             self._pairing_started = False
             return
 
-        self.qr_status.set("Paired! Looking for the connect address...")
-        self.pin_status.set("Paired! Looking for the connect address...")
+        msg = "Paired! Looking for the connect address..."
+        self._set_status(self.qr_status_label, self.qr_status_var, msg)
+        self._set_status(self.pin_status_label, self.pin_status_var, msg)
         threading.Thread(target=self._connect_worker, daemon=True).start()
 
     def _connect_worker(self):
@@ -120,14 +141,15 @@ class WifiPairDialog(tk.Toplevel):
     def _finish_connect(self, host, port):
         if host is None:
             msg = "Paired, but couldn't auto-detect the connect address."
-            self.qr_status.set(msg)
-            self.pin_status.set(msg)
+            self._set_status(self.qr_status_label, self.qr_status_var, msg)
+            self._set_status(self.pin_status_label, self.pin_status_var, msg)
             return
 
         ok, output = run_adb("connect", f"{host}:{port}")
         if ok:
-            self.qr_status.set(f"Connected to {host}:{port}")
-            self.pin_status.set(f"Connected to {host}:{port}")
+            msg = f"\u2714 Connected to {host}:{port}"
+            self._set_status(self.qr_status_label, self.qr_status_var, msg, CONNECTED_COLOR, big=True)
+            self._set_status(self.pin_status_label, self.pin_status_var, msg, CONNECTED_COLOR, big=True)
             if self.on_paired:
                 self.on_paired()
         else:
