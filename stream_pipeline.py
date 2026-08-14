@@ -76,6 +76,8 @@ class StreamPipeline:
         self._vcam_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._vcam_failed = False
+        self._pending_device_size: Optional[tuple] = None
+        self.camera.pad_color = self.config.background
 
         self.frames_dropped = 0
         self._process_seconds = 0.0
@@ -148,10 +150,20 @@ class StreamPipeline:
         self.ai.set_mask_sharpness(sharpness)
 
     def set_output_size(self, width: int, height: int) -> None:
-        """Change the output resolution; the device reopens on the next frame."""
+        """Change the output resolution.
+
+        The composition changes immediately. Reopening the camera device is queued
+        for the sender thread, because the driver call can block for a moment and
+        must not run on the UI thread.
+        """
         size = even_size((width, height))
         self.config.output_size = size
-        self.camera.request_size(*size)
+        self.camera.pad_color = self.config.background
+
+        if self.camera.is_open:
+            self._pending_device_size = size
+        else:
+            self.camera.request_size(*size)
 
     # ------------------------------------------------------------ handshake
 
@@ -226,6 +238,11 @@ class StreamPipeline:
 
     def _vcam_worker(self) -> None:
         while not self._stop_event.is_set():
+            pending = self._pending_device_size
+            if pending is not None:
+                self._pending_device_size = None
+                self._apply_device_size(pending)
+
             try:
                 frame = self._vcam_queue.get(timeout=0.25)
             except queue.Empty:
@@ -242,6 +259,23 @@ class StreamPipeline:
                 self._vcam_failed = True
                 self._emit_vcam_error(f"Virtual camera send failed: {exc}")
                 return
+
+    def _apply_device_size(self, size) -> None:
+        """Reopen the camera device at a new resolution, on the sender thread."""
+        self._drain_vcam_queue()
+        if self.camera.reopen_at(*size):
+            self._emit_vcam_status(
+                f"{self.camera.device_name} {size[0]}x{size[1]} - "
+                "reselect the camera in your app"
+            )
+        else:
+            current = self.camera.size
+            detail = f"{current[0]}x{current[1]}" if current else "closed"
+            self._emit_vcam_error(
+                f"Could not switch the camera device to {size[0]}x{size[1]}.\n\n"
+                f"Still running at {detail}. Close any app currently using the "
+                f"camera and try again.\n\n{self.camera.last_error or ''}"
+            )
 
     def _drain_vcam_queue(self) -> None:
         while True:

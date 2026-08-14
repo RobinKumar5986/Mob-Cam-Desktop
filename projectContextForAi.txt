@@ -1,0 +1,147 @@
+MOB CAM - PROJECT CONTEXT FOR AI
+================================
+
+WHAT IT IS
+Android phone streams camera frames over USB (adb forward, TCP 4343) to a
+desktop Python app. The desktop processes them and publishes the result as a
+real OS camera device, so Zoom / Meet / Teams / browsers can pick it.
+
+"Use PC" toggle on the phone decides who does the work:
+  OFF -> phone applies effects, desktop only does geometry
+  ON  -> phone sends raw frames, desktop does all AI (faster, better quality)
+
+Phone is the TCP server. Desktop is the client.
+
+
+DESKTOP FILES (Python)
+----------------------
+receiver_gui.py      Tk UI. Device picker, shape, resolution, fps, mirror,
+                     virtual-camera panel, AI status, throughput, edge-sharpness
+                     slider, preview window. Entry point: python receiver_gui.py
+
+stream_pipeline.py   Wires everything together and owns the threads.
+                     StreamPipeline.start()/stop(), set_output_size(),
+                     set_mask_sharpness(), stats().
+
+protocol.py          Wire format shared with the Java side. Message types,
+                     MessageReader, encode/decode helpers.
+
+data_receiver.py     Reads the socket, drops stale frames, decodes JPEG,
+                     dispatches. Contains LatestSlot (depth-1 handoff).
+
+image_processing.py  The stage pipeline over BGR numpy frames. Stage order:
+                     rotate, mirror, color_filter, head_lock, background, blur,
+                     crop_shape, fit_output, shape_mask.
+
+ai_processing.py     Segmentation + face tracking (MediaPipe), mask sharpening,
+                     compositing, background replace/blur, model download.
+
+virtual_camera.py    pyvirtualcam wrapper. Picks the backend per OS, opens the
+                     device, conforms frames, reopen_at() for size changes.
+
+remote_settings.py   Model of the phone's settings received in HELLO.
+                     ARGB<->BGR conversion, ISO gain curve.
+
+desktop_settings.py  Persists local UI preferences to ~/.mobcam/settings.json.
+
+adb_wifi.py          mDNS discovery for wireless adb pairing.
+adb_wifi_dialog.py   QR-code / pairing-code dialog.
+
+requirements.txt     numpy opencv-python pillow pyvirtualcam mediapipe
+                     qrcode zeroconf
+
+
+ANDROID FILES (Java, package com.kgjr.mobcam)
+---------------------------------------------
+fragmets/MobCamFragment.java        Main screen: preview, Start/Stop, Use PC
+                                    toggle, Dim, flip, FPS readout.
+fragmets/SettingFragment.java       Effect and colour controls.
+helpers/FrameStreamer.java          TCP server, framing, handshake, ACK reader.
+helpers/ConfigPayload.java          Builds the HELLO JSON + background JPEG.
+helpers/RawFrameEncoder.java        PC-mode fast path, rotates NV21 directly.
+helpers/FrameRateLimiter.java       Frame pacing towards the target fps.
+helpers/ImageProcessor.java         Phone-side effects.
+helpers/CameraHelper.java           CameraX setup.
+helpers/FaceHeadLockProcessor.java  ML Kit face detect for head-lock.
+localDb/SettingSharePreference.java SharedPreferences, includes use_pc.
+res/layout/fragment_mob_cam.xml     Main screen layout.
+
+
+PROTOCOL
+--------
+message = [1 byte type][4 bytes big-endian length][payload]
+
+0x01 HELLO      phone->PC  JSON, all settings, includes usePc, hasBackground
+0x02 BACKGROUND phone->PC  JPEG of the selected background
+0x03 ACK        PC->phone  JSON, mode + output size + AI status
+0x04 FRAME      phone->PC  JPEG
+0x05 SETTINGS   phone->PC  JSON, partial live update
+0x06 BYE        either     empty
+
+Handshake: HELLO -> (BACKGROUND) -> ACK -> then frames. Phone starts anyway
+after 4s if no ACK. A leading 0x00 means an old bare-JPEG stream (still read).
+
+
+THREADS
+-------
+Tk main          all UI, must never block on socket or driver calls
+data-receiver    reads the socket only
+frame-processor  decodes and runs the pipeline
+virtual-camera   sends to the device, owns device reopens
+
+
+RULES THAT MATTER
+-----------------
+1. No queue deeper than one frame anywhere. Latency grows otherwise.
+2. Always drain the socket. Not reading just moves the queue into the kernel.
+3. Device format is fixed while open; frames are letterboxed to fit.
+   Only reopen_at() changes it, only from the vcam thread.
+4. Never call driver or socket APIs from the Tk thread.
+5. AI stages no-op when usePc is false, or effects get applied twice.
+6. Copy MediaPipe numpy_view() output; it aliases memory the library reuses.
+7. Use even pixel dimensions.
+8. HELLO keys must match between ConfigPayload.java and remote_settings.py.
+9. A failing pipeline stage must be skipped, not fatal.
+
+
+SETUP
+-----
+python -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+python receiver_gui.py
+
+Needs a loopback camera driver:
+  Windows / macOS  install OBS Studio, launch once
+  Linux            sudo modprobe v4l2loopback devices=1 video_nr=10 \
+                     card_label='Mob Cam' exclusive_caps=1
+                   (exclusive_caps=1 required or browsers won't list it)
+
+AI models auto-download to ~/.mobcam/models, or drop .tflite files in a
+models/ folder next to the scripts. Inference is fully local.
+
+
+KNOWN OPEN ISSUES
+-----------------
+- Changing output resolution while streaming still misbehaves. Device reopen
+  retries and falls back, but a connected app cannot renegotiate the format and
+  must reselect the camera. Not fully diagnosed.
+- desktop_settings.get() returns None for a key missing from DEFAULTS, and the
+  GUI int()s some of them -> add a setting to DEFAULTS first or startup crashes.
+- Android ImageProcessor.applyBlur is a stub, so blur only works in PC mode.
+- opencv-contrib-python would enable guided-filter edge refinement (sharper
+  hair edges) instead of the bilateral fallback.
+
+
+TESTS
+-----
+Plain scripts in the project dir, no framework:
+  test_full, test_phone_mode, test_fixes, test_realtime, test_before_after,
+  test_sharpness, test_resize, test_settings, test_download, test_nv21,
+  test_ratelimit, test_gui_persist (needs a display)
+Run: python3 test_full.py    etc.
+
+
+CODE STYLE
+----------
+Short docstrings saying what a function does. Inline comments only where the
+reason is non-obvious. No narration of the obvious.

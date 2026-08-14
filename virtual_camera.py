@@ -15,15 +15,18 @@ Backends per OS:
     Linux    v4l2loopback (kernel module, creates /dev/videoN)
 
 A camera device advertises exactly one resolution for as long as it is open, so
-the device format is fixed at open time and every frame is conformed to it.
-Reopening mid-stream would break any app already consuming the feed, so a size
-change is deferred until request_size() is called explicitly.
+the device format is fixed at open time and every frame is conformed to it. A
+resolution change therefore means closing and reopening the device, which is
+done only through reopen_at() - never implicitly on a frame - and which retries,
+then falls back to the previous format if the driver refuses, so the feed keeps
+running instead of dying.
 """
 
 from __future__ import annotations
 
 import platform
 import threading
+import time
 from typing import Optional, Tuple
 
 import cv2
@@ -78,6 +81,10 @@ SETUP_INSTRUCTIONS = {
         "/etc/modules-load.d/ and the options to /etc/modprobe.d/."
     ),
 }
+
+
+REOPEN_ATTEMPTS = 4
+REOPEN_SETTLE_SECONDS = 0.2
 
 
 class VirtualCameraError(RuntimeError):
@@ -158,6 +165,8 @@ class VirtualCamera:
         self.device = device
         self.pace = pace
         self.on_status = on_status
+        self.pad_color: Tuple[int, int, int] = (0, 0, 0)
+        self.last_error: Optional[str] = None
 
         self._cam = None
         self._size: Optional[Tuple[int, int]] = None
@@ -183,9 +192,54 @@ class VirtualCamera:
         return self._size
 
     def request_size(self, width: int, height: int) -> None:
-        """Ask for a new device resolution, applied on the next frame."""
+        """Set the resolution the device will use the next time it is opened.
+
+        Only affects an open that has not happened yet. Use reopen_at() to change
+        the format of a device that is already live.
+        """
         with self._lock:
             self._pending_size = even_size(width, height)
+
+    def reopen_at(self, width: int, height: int,
+                  attempts: int = REOPEN_ATTEMPTS) -> bool:
+        """Close and reopen the device at a new resolution.
+
+        Retries, because a driver that still has the old handle in flight reports
+        the device busy for a moment. If every attempt fails the previous format
+        is restored, so a rejected change costs the user nothing.
+
+        Call this from the thread that sends frames, never from the UI thread.
+        """
+        target = even_size(width, height)
+        with self._lock:
+            if self._cam is not None and self._size == target:
+                return True
+
+            previous = self._size
+            self._close_locked()
+            time.sleep(REOPEN_SETTLE_SECONDS)
+
+            failure = None
+            for attempt in range(max(1, attempts)):
+                try:
+                    self._open_locked(*target)
+                    self.last_error = None
+                    return True
+                except VirtualCameraError as exc:
+                    failure = exc
+                    time.sleep(REOPEN_SETTLE_SECONDS * (attempt + 1))
+
+            self.last_error = str(failure)
+            if previous is not None:
+                try:
+                    self._open_locked(*previous)
+                    self._notify(
+                        f"kept {previous[0]}x{previous[1]}, "
+                        f"{target[0]}x{target[1]} was refused"
+                    )
+                except VirtualCameraError:
+                    pass
+            return False
 
     def open(self, width: int, height: int) -> None:
         """Open the device at the given resolution."""
@@ -252,12 +306,12 @@ class VirtualCamera:
         with self._lock:
             if self._cam is None:
                 self._open_locked(*(self._pending_size or even_size(width, height)))
-            elif self._pending_size and self._pending_size != self._size:
-                self._open_locked(*self._pending_size)
 
             target_w, target_h = self._size
             if (width, height) != (target_w, target_h):
-                frame = conform(frame, target_w, target_h)
+                # Letterboxed rather than reopened: changing the device format
+                # under a connected app is what breaks its stream.
+                frame = conform(frame, target_w, target_h, self.pad_color)
 
             self._cam.send(np.ascontiguousarray(frame))
             self.frames_sent += 1

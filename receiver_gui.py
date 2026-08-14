@@ -115,6 +115,7 @@ class ConfigWindow:
         self._download_window = None
         self._save_job = None
         self._stats_job = None
+        self._resize_job = None
 
         self.config = ProcessingConfig(
             shape=self.settings.choose("shape", SHAPES),
@@ -297,15 +298,27 @@ class ConfigWindow:
         self._schedule_save()
 
     def _on_resolution_changed(self, *_):
+        """Debounced so scrolling through the list does not thrash the driver."""
         size = dict(RESOLUTIONS).get(self.res_var.get())
         if not size:
             return
         self.config.output_size = size
         self._schedule_save()
+
+        if self.stream is None:
+            return
+        if self._resize_job is not None:
+            try:
+                self.root.after_cancel(self._resize_job)
+            except tk.TclError:
+                pass
+        self.status_var.set(f"Switching output to {size[0]}x{size[1]}...")
+        self._resize_job = self.root.after(600, lambda: self._apply_resolution(size))
+
+    def _apply_resolution(self, size):
+        self._resize_job = None
         if self.stream is not None:
             self.stream.set_output_size(*size)
-            self.status_var.set(
-                f"Output {size[0]}x{size[1]} - reselect the camera in your app")
 
     def _on_pin_changed(self, *_):
         if self.viewer is not None:
@@ -396,7 +409,15 @@ class ConfigWindow:
         self.root.after(0, lambda: self.vcam_status_var.set(f"✔ {message}"))
 
     def _on_vcam_error(self, message):
+        recoverable = "Could not switch" in message
+
         def show():
+            if recoverable:
+                # The device is still live at its previous size, so the toggle
+                # stays on and only the message changes.
+                self.vcam_status_var.set("Resolution change refused - see details")
+                HelpWindow(self.root, "Virtual camera", message)
+                return
             self.vcam_status_var.set("Virtual camera stopped - click Setup help")
             self._vcam_available = False
             self._vcam_message = message
