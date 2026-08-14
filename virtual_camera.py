@@ -1,24 +1,33 @@
 """Virtual camera sink.
 
 Last stage of the pipeline: takes processed BGR frames and pushes them into a
-real OS-level camera device so that Zoom / Meet / Teams / OBS / browsers see
-"Mob Cam" in their camera dropdown.
+real OS-level camera device so that Zoom / Meet / Teams / OBS / browsers see a
+camera in their dropdown.
 
-A Tk window is only pixels on screen; applications enumerate camera *devices*
-from the OS (DirectShow / Media Foundation on Windows, AVFoundation on macOS,
-V4L2 on Linux). pyvirtualcam writes into a loopback driver that is already
-registered with the OS, which is what makes us appear as a source.
+A window is only pixels on screen; applications enumerate camera *devices* from
+the OS (DirectShow / Media Foundation on Windows, AVFoundation on macOS, V4L2 on
+Linux). pyvirtualcam writes into a loopback driver already registered with the
+OS, which is what makes us appear as a source.
 
 Backends per OS:
     Windows  obs (OBS Virtual Camera) or unitycapture
     macOS    obs (OBS Virtual Camera, OBS >= 26.1)
     Linux    v4l2loopback (kernel module, creates /dev/videoN)
+
+A camera device advertises exactly one resolution for as long as it is open, so
+the device format is fixed at open time and every frame is conformed to it.
+Reopening mid-stream would break any app already consuming the feed, so a size
+change is deferred until request_size() is called explicitly.
 """
 
 from __future__ import annotations
 
 import platform
 import threading
+from typing import Optional, Tuple
+
+import cv2
+import numpy as np
 
 try:
     import pyvirtualcam
@@ -26,7 +35,7 @@ try:
 
     PYVIRTUALCAM_AVAILABLE = True
     PYVIRTUALCAM_IMPORT_ERROR = None
-except Exception as exc:  # pragma: no cover - depends on environment
+except Exception as exc:  # pragma: no cover
     pyvirtualcam = None
     PixelFormat = None
     PYVIRTUALCAM_AVAILABLE = False
@@ -37,7 +46,6 @@ OS_WINDOWS = "Windows"
 OS_MACOS = "Darwin"
 OS_LINUX = "Linux"
 
-# Tried in order; the first one that opens wins.
 BACKEND_PREFERENCE = {
     OS_WINDOWS: ("obs", "unitycapture"),
     OS_MACOS: ("obs",),
@@ -77,28 +85,31 @@ class VirtualCameraError(RuntimeError):
 
 
 def current_os() -> str:
-    """'Windows', 'Darwin' (macOS) or 'Linux'."""
+    """Return 'Windows', 'Darwin' (macOS) or 'Linux'."""
     return platform.system()
 
 
-def preferred_backends(os_name: str | None = None) -> tuple[str, ...]:
+def preferred_backends(os_name: Optional[str] = None) -> Tuple[str, ...]:
+    """Backends to try, in order, for the given OS."""
     return BACKEND_PREFERENCE.get(os_name or current_os(), ())
 
 
-def setup_instructions(os_name: str | None = None) -> str:
+def setup_instructions(os_name: Optional[str] = None) -> str:
+    """Human-readable driver setup steps for the given OS."""
     os_name = os_name or current_os()
     return SETUP_INSTRUCTIONS.get(
         os_name, f"Virtual camera output is not supported on {os_name}."
     )
 
 
-def probe(width: int = 640, height: int = 480, fps: int = 30) -> tuple[bool, str]:
-    """Check whether a virtual camera can be opened, without keeping it open.
+def even_size(width: int, height: int) -> Tuple[int, int]:
+    """Round a size down to even numbers, which some drivers require."""
+    width, height = int(width), int(height)
+    return max(2, width - width % 2), max(2, height - height % 2)
 
-    Returns (ok, message). Safe to call from a background thread at startup so
-    the UI can grey out the toggle and show the setup hint instead of failing
-    only once the user tries to stream.
-    """
+
+def probe(width: int = 640, height: int = 480, fps: int = 30) -> Tuple[bool, str]:
+    """Check whether a virtual camera can be opened, then release it."""
     if not PYVIRTUALCAM_AVAILABLE:
         return False, (
             "pyvirtualcam is not installed.\n\n    pip install pyvirtualcam\n\n"
@@ -115,40 +126,45 @@ def probe(width: int = 640, height: int = 480, fps: int = 30) -> tuple[bool, str
         cam.close()
 
 
+def conform(frame: np.ndarray, width: int, height: int,
+            pad_color=(0, 0, 0)) -> np.ndarray:
+    """Fit a frame to an exact size without distorting it, padding the rest."""
+    frame_h, frame_w = frame.shape[:2]
+    if (frame_w, frame_h) == (width, height):
+        return frame
+
+    scale = min(width / frame_w, height / frame_h)
+    new_w = max(1, min(width, int(round(frame_w * scale))))
+    new_h = max(1, min(height, int(round(frame_h * scale))))
+    interpolation = cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR
+    resized = cv2.resize(frame, (new_w, new_h), interpolation=interpolation)
+
+    if (new_w, new_h) == (width, height):
+        return resized
+
+    canvas = np.full((height, width, 3), pad_color, dtype=np.uint8)
+    x = (width - new_w) // 2
+    y = (height - new_h) // 2
+    canvas[y:y + new_h, x:x + new_w] = resized
+    return canvas
+
+
 class VirtualCamera:
-    """Thread-safe wrapper around pyvirtualcam.
+    """Thread-safe pyvirtualcam wrapper with a stable device format."""
 
-    Opens lazily on the first frame, because the frame size is only known once
-    the pipeline has produced something, and transparently reopens the device
-    if the output resolution changes mid-session.
-    """
-
-    def __init__(
-        self,
-        fps: int = 30,
-        device: str | None = None,
-        pace: bool = False,
-        on_status=None,
-    ):
-        """
-        fps     advertised frame rate of the virtual device
-        device  explicit device to use, e.g. '/dev/video10' on Linux
-        pace    block each send until the next frame slot is due. Leave False
-                when the phone drives the timing, else the receiver thread
-                gets throttled and frames back up.
-        """
+    def __init__(self, fps: int = 30, device: Optional[str] = None,
+                 pace: bool = False, on_status=None):
         self.fps = fps
         self.device = device
         self.pace = pace
         self.on_status = on_status
 
         self._cam = None
-        self._size: tuple[int, int] | None = None
+        self._size: Optional[Tuple[int, int]] = None
+        self._pending_size: Optional[Tuple[int, int]] = None
         self._lock = threading.Lock()
         self._attempt_errors: list[str] = []
         self.frames_sent = 0
-
-    # ---------------------------------------------------------------- state
 
     @property
     def is_open(self) -> bool:
@@ -163,14 +179,18 @@ class VirtualCamera:
         return getattr(self._cam, "backend", "") or ""
 
     @property
-    def size(self) -> tuple[int, int] | None:
+    def size(self) -> Optional[Tuple[int, int]]:
         return self._size
 
-    # ----------------------------------------------------------- lifecycle
+    def request_size(self, width: int, height: int) -> None:
+        """Ask for a new device resolution, applied on the next frame."""
+        with self._lock:
+            self._pending_size = even_size(width, height)
 
     def open(self, width: int, height: int) -> None:
+        """Open the device at the given resolution."""
         with self._lock:
-            self._open_locked(width, height)
+            self._open_locked(*even_size(width, height))
 
     def _open_locked(self, width: int, height: int) -> None:
         if not PYVIRTUALCAM_AVAILABLE:
@@ -179,10 +199,6 @@ class VirtualCamera:
             )
 
         self._close_locked()
-
-        # Odd dimensions break some drivers' YUV conversion.
-        width -= width % 2
-        height -= height % 2
 
         os_name = current_os()
         backends = preferred_backends(os_name)
@@ -194,22 +210,18 @@ class VirtualCamera:
         self._attempt_errors = []
         for backend in backends:
             kwargs = dict(
-                width=width,
-                height=height,
-                fps=self.fps,
-                fmt=PixelFormat.BGR,  # matches OpenCV, no extra conversion
-                backend=backend,
-                print_fps=False,
+                width=width, height=height, fps=self.fps,
+                fmt=PixelFormat.BGR, backend=backend, print_fps=False,
             )
             if self.device:
                 kwargs["device"] = self.device
             try:
                 self._cam = pyvirtualcam.Camera(**kwargs)
                 self._size = (width, height)
+                self._pending_size = None
                 self.frames_sent = 0
                 self._notify(
-                    f"Virtual camera live: {self.device_name} "
-                    f"{width}x{height}@{self.fps} ({backend})"
+                    f"{self.device_name} {width}x{height}@{self.fps} ({backend})"
                 )
                 return
             except Exception as exc:
@@ -221,6 +233,7 @@ class VirtualCamera:
         )
 
     def close(self) -> None:
+        """Release the device."""
         with self._lock:
             self._close_locked()
 
@@ -230,28 +243,26 @@ class VirtualCamera:
                 self._cam.close()
             except Exception:
                 pass
-            self._cam = None
-            self._size = None
+        self._cam = None
+        self._size = None
 
-    # ---------------------------------------------------------------- send
-
-    def send(self, frame) -> None:
-        """Push one BGR numpy frame. Opens/reopens the device as needed."""
+    def send(self, frame: np.ndarray) -> None:
+        """Push one BGR frame, conforming it to the device resolution."""
         height, width = frame.shape[:2]
         with self._lock:
-            if self._cam is None or self._size != (width, height):
-                self._open_locked(width, height)
-                # Dimensions may have been rounded down to even numbers.
-                if self._size != (width, height):
-                    target_w, target_h = self._size
-                    frame = frame[:target_h, :target_w]
+            if self._cam is None:
+                self._open_locked(*(self._pending_size or even_size(width, height)))
+            elif self._pending_size and self._pending_size != self._size:
+                self._open_locked(*self._pending_size)
 
-            self._cam.send(frame)
+            target_w, target_h = self._size
+            if (width, height) != (target_w, target_h):
+                frame = conform(frame, target_w, target_h)
+
+            self._cam.send(np.ascontiguousarray(frame))
             self.frames_sent += 1
             if self.pace:
                 self._cam.sleep_until_next_frame()
-
-    # --------------------------------------------------------------- misc
 
     def _notify(self, message: str) -> None:
         if self.on_status:

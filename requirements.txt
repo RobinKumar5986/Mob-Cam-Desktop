@@ -2,5 +2,6 @@ numpy
 opencv-python
 pillow
 pyvirtualcam
+mediapipe
 qrcode
 zeroconf

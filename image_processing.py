@@ -1,62 +1,73 @@
 """Image processing layer.
 
-Sits between the frame receiver and the virtual camera:
+Sits between the data receiver and the virtual camera:
 
     device frames -> [ image_processing ] -> virtual camera / preview
 
-Everything here operates on OpenCV BGR numpy arrays and returns numpy arrays,
-so no PIL round-trips happen in the hot path.
+Stage order mirrors the Android ImageProcessor, so a frame looks the same
+whether the phone processed it or the desktop did:
 
-The pipeline is an ordered list of named stages. Adding future processing
-(background removal, face tracking, beautify, LUTs, overlays...) means writing
-a callable ``fn(frame, config) -> frame`` and registering it:
+    rotate -> mirror -> color_filter -> head_lock -> background -> blur
+           -> crop_shape -> fit_output -> shape_mask
 
-    pipeline.insert_before("fit_output", "segment", my_background_removal)
+The AI stages (head_lock, background, blur) only do work when the phone is in
+"USE PC" mode; otherwise the phone has already applied them and they pass
+through. Register future stages with pipeline.insert_before(...).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, List, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import cv2
 import numpy as np
 
-# Shapes
+import ai_processing
+from remote_settings import RemoteSettings, clamp_iso_gain
+
 SHAPE_SQUARE = "square"
 SHAPE_CIRCLE = "circle"
-SHAPE_SOURCE = "source"  # keep the phone's native aspect ratio
+SHAPE_SOURCE = "source"
 
-# Chroma key green, in BGR. Matches BG_KEY_COLOR in the GUI so the preview and
-# the virtual camera letterbox to the same colour.
 GREEN_BGR = (0, 255, 0)
 BLACK_BGR = (0, 0, 0)
+
+_LUMA = (0.213, 0.715, 0.072)
 
 
 @dataclass
 class ProcessingConfig:
-    """Live-mutable settings. The pipeline reads these per frame, so the UI can
-    change them at any time without rebuilding anything."""
+    """Live-mutable settings read once per frame."""
 
     shape: str = SHAPE_SQUARE
-    output_size: Tuple[int, int] = (720, 720)  # (width, height) sent to the vcam
-    mirror: bool = False       # horizontal flip, selfie-style
-    rotation: int = 0          # 0 / 90 / 180 / 270, clockwise
+    output_size: Tuple[int, int] = (720, 720)
+    mirror: bool = False
+    rotation: int = 0
     background: Tuple[int, int, int] = GREEN_BGR
-    # Reserved for future stages so they have somewhere to keep their options.
+
+    remote: RemoteSettings = field(default_factory=RemoteSettings)
+    ai: Optional[ai_processing.AIEngine] = None
+
+    frame_state: dict = field(default_factory=dict, repr=False)
     extra: dict = field(default_factory=dict)
 
     def normalized_rotation(self) -> int:
         return int(self.rotation) % 360
 
+    @property
+    def pc_mode(self) -> bool:
+        return bool(self.remote and self.remote.use_pc)
+
 
 Stage = Callable[[np.ndarray, ProcessingConfig], np.ndarray]
 
 
-# --------------------------------------------------------------------- stages
+# ------------------------------------------------------------ geometry stages
 
 
 def stage_rotate(frame: np.ndarray, config: ProcessingConfig) -> np.ndarray:
+    """Rotate the frame in 90 degree steps."""
     rotation = config.normalized_rotation()
     if rotation == 90:
         return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
@@ -68,14 +79,14 @@ def stage_rotate(frame: np.ndarray, config: ProcessingConfig) -> np.ndarray:
 
 
 def stage_mirror(frame: np.ndarray, config: ProcessingConfig) -> np.ndarray:
+    """Flip horizontally for a selfie-style image."""
     return cv2.flip(frame, 1) if config.mirror else frame
 
 
 def stage_crop_shape(frame: np.ndarray, config: ProcessingConfig) -> np.ndarray:
-    """Centre-crop to a square for the square/circle shapes."""
+    """Centre-crop to a square unless the source aspect is being kept."""
     if config.shape == SHAPE_SOURCE:
         return frame
-
     height, width = frame.shape[:2]
     side = min(width, height)
     left = (width - side) // 2
@@ -84,16 +95,8 @@ def stage_crop_shape(frame: np.ndarray, config: ProcessingConfig) -> np.ndarray:
 
 
 def stage_fit_output(frame: np.ndarray, config: ProcessingConfig) -> np.ndarray:
-    """Scale to fit the fixed output canvas without distorting, letterboxing the
-    remainder with the background colour.
-
-    The output size must stay constant frame to frame, because a virtual camera
-    device advertises one fixed resolution.
-    """
-    out_w, out_h = config.output_size
-    out_w = max(2, out_w - out_w % 2)
-    out_h = max(2, out_h - out_h % 2)
-
+    """Scale to fit the fixed output canvas, letterboxing the remainder."""
+    out_w, out_h = even_size(config.output_size)
     height, width = frame.shape[:2]
     if height == 0 or width == 0:
         return np.full((out_h, out_w, 3), config.background, dtype=np.uint8)
@@ -114,36 +117,165 @@ def stage_fit_output(frame: np.ndarray, config: ProcessingConfig) -> np.ndarray:
     return canvas
 
 
-def stage_shape_mask(frame: np.ndarray, config: ProcessingConfig) -> np.ndarray:
-    """Knock the corners off for the circle shape.
+_CIRCLE_CACHE: dict = {}
 
-    Note: a virtual camera carries no alpha channel, so the circle is sent as a
-    circle on a solid background. The receiving app has to chroma-key the green
-    itself if it wants a real cut-out.
-    """
+
+def circle_alpha(width: int, height: int) -> np.ndarray:
+    """Cached anti-aliased circular alpha for the current output size."""
+    key = (width, height)
+    alpha = _CIRCLE_CACHE.get(key)
+    if alpha is None:
+        mask = np.zeros((height, width), dtype=np.uint8)
+        radius = min(width, height) // 2
+        cv2.circle(mask, (width // 2, height // 2), radius, 255, -1,
+                   lineType=cv2.LINE_AA)
+        alpha = mask.astype(np.float32) / 255.0
+        _CIRCLE_CACHE.clear()
+        _CIRCLE_CACHE[key] = alpha
+    return alpha
+
+
+def stage_shape_mask(frame: np.ndarray, config: ProcessingConfig) -> np.ndarray:
+    """Knock the corners off for the circle shape."""
     if config.shape != SHAPE_CIRCLE:
         return frame
 
     height, width = frame.shape[:2]
-    radius = min(width, height) // 2
-    mask = np.zeros((height, width), dtype=np.uint8)
-    cv2.circle(mask, (width // 2, height // 2), radius, 255, -1, lineType=cv2.LINE_AA)
+    plate = ai_processing.solid_plate(width, height, config.background)
+    return ai_processing.composite(frame, plate, circle_alpha(width, height))
 
-    background = np.full_like(frame, config.background)
-    alpha = (mask.astype(np.float32) / 255.0)[:, :, None]
-    return (frame * alpha + background * (1.0 - alpha)).astype(np.uint8)
+
+# --------------------------------------------------------------- colour stage
+
+
+def stage_color_filter(frame: np.ndarray, config: ProcessingConfig) -> np.ndarray:
+    """Apply contrast, brightness, saturation, ISO gain and white balance."""
+    settings = config.remote
+    if settings is None or not settings.use_pc:
+        return frame
+
+    matrix = color_matrix_bgr(
+        settings.contrast, settings.brightness, settings.saturation,
+        settings.iso, settings.wb_position,
+    )
+    if matrix is None:
+        return frame
+    return cv2.transform(frame, matrix)
+
+
+def color_matrix_bgr(contrast: int, brightness: int, saturation: int,
+                     iso: int, wb_position: int) -> Optional[np.ndarray]:
+    """Build the 3x4 BGR colour matrix equivalent to the Android ColorMatrix."""
+    contrast_f = contrast / 100.0
+    brightness_f = brightness - 100.0
+    saturation_f = saturation / 100.0
+    scale = contrast_f * clamp_iso_gain(iso)
+
+    wb_shift = (wb_position - 50) / 50.0
+    offsets_rgb = np.array([
+        brightness_f + wb_shift * 35.0,
+        brightness_f - abs(wb_shift) * 8.0,
+        brightness_f - wb_shift * 35.0,
+    ], dtype=np.float32)
+
+    if (abs(scale - 1.0) < 1e-3 and abs(saturation_f - 1.0) < 1e-3
+            and np.all(np.abs(offsets_rgb) < 1e-3)):
+        return None
+
+    base = np.eye(3, dtype=np.float32) * scale
+
+    inv_sat = 1.0 - saturation_f
+    lr, lg, lb = (c * inv_sat for c in _LUMA)
+    sat = np.array([
+        [lr + saturation_f, lg, lb],
+        [lr, lg + saturation_f, lb],
+        [lr, lg, lb + saturation_f],
+    ], dtype=np.float32)
+
+    linear_rgb = sat @ base
+    offset_rgb = sat @ offsets_rgb
+
+    swap = np.array([[0, 0, 1], [0, 1, 0], [1, 0, 0]], dtype=np.float32)
+    linear_bgr = swap @ linear_rgb @ swap
+    offset_bgr = swap @ offset_rgb
+
+    return np.hstack([linear_bgr, offset_bgr.reshape(3, 1)]).astype(np.float32)
+
+
+# ------------------------------------------------------------------ AI stages
+
+
+def stage_head_lock(frame: np.ndarray, config: ProcessingConfig) -> np.ndarray:
+    """Crop and zoom so the tracked face stays centred."""
+    settings = config.remote
+    if not config.pc_mode or not settings.head_lock or config.ai is None:
+        return frame
+    box = config.ai.face_box(frame)
+    if box is None:
+        return frame
+    return ai_processing.zoom_to_face(frame, box)
+
+
+def stage_background(frame: np.ndarray, config: ProcessingConfig) -> np.ndarray:
+    """Replace the background with the phone's image or its chroma colour."""
+    settings = config.remote
+    if not config.pc_mode or not settings.remove_background or config.ai is None:
+        return frame
+
+    mask = _person_mask(frame, config)
+    if mask is None:
+        return frame
+
+    background = None
+    if settings.background_option:
+        background = config.ai.background_for(
+            settings.background_image, frame.shape[1], frame.shape[0]
+        )
+    return ai_processing.replace_background(
+        frame, mask, background, settings.chroma_color
+    )
+
+
+def stage_blur(frame: np.ndarray, config: ProcessingConfig) -> np.ndarray:
+    """Blur the background while keeping the person sharp."""
+    settings = config.remote
+    if not config.pc_mode or not settings.blur_enabled or settings.blur_intensity <= 0:
+        return frame
+    mask = _person_mask(frame, config) if config.ai is not None else None
+    return ai_processing.blur_background(frame, mask, settings.blur_intensity)
+
+
+def _person_mask(frame: np.ndarray, config: ProcessingConfig) -> Optional[np.ndarray]:
+    """Segment once per frame and share the mask between stages."""
+    cached = config.frame_state.get("person_mask")
+    if cached is not None and cached.shape[:2] == frame.shape[:2]:
+        return cached
+    mask = config.ai.person_mask(frame) if config.ai is not None else None
+    if mask is not None:
+        config.frame_state["person_mask"] = mask
+    return mask
+
+
+# ------------------------------------------------------------------- pipeline
 
 
 DEFAULT_STAGES: List[Tuple[str, Stage]] = [
     ("rotate", stage_rotate),
     ("mirror", stage_mirror),
+    ("color_filter", stage_color_filter),
+    ("head_lock", stage_head_lock),
+    ("background", stage_background),
+    ("blur", stage_blur),
     ("crop_shape", stage_crop_shape),
     ("fit_output", stage_fit_output),
     ("shape_mask", stage_shape_mask),
 ]
 
 
-# ------------------------------------------------------------------- pipeline
+def even_size(size: Tuple[int, int]) -> Tuple[int, int]:
+    """Round a size down to even numbers, which virtual camera drivers require."""
+    width, height = int(size[0]), int(size[1])
+    return max(2, width - width % 2), max(2, height - height % 2)
 
 
 class ProcessingPipeline:
@@ -155,19 +287,15 @@ class ProcessingPipeline:
             DEFAULT_STAGES if stages is None else stages
         )
 
-    # -- introspection
-
     @property
     def stage_names(self) -> List[str]:
         return [name for name, _ in self._stages]
 
     def _index_of(self, name: str) -> int:
-        for i, (stage_name, _) in enumerate(self._stages):
+        for index, (stage_name, _) in enumerate(self._stages):
             if stage_name == name:
-                return i
+                return index
         raise KeyError(f"No such stage: {name!r} (have {self.stage_names})")
-
-    # -- mutation, for future processing modules
 
     def append(self, name: str, fn: Stage) -> None:
         self._stages.append((name, fn))
@@ -184,15 +312,12 @@ class ProcessingPipeline:
     def remove(self, name: str) -> None:
         del self._stages[self._index_of(name)]
 
-    # -- hot path
-
-    def process(self, frame: np.ndarray) -> np.ndarray:
-        """Run every stage in order. A stage that raises is skipped rather than
-        killing the stream, so one bad experimental filter cannot take the
-        camera down mid-call."""
+    def process(self, frame: np.ndarray) -> Optional[np.ndarray]:
+        """Run every stage in order; a failing stage is skipped, not fatal."""
         if frame is None:
             return None
         config = self.config
+        config.frame_state.clear()
         for name, fn in self._stages:
             try:
                 result = fn(frame, config)
