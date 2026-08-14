@@ -1,5 +1,6 @@
-opencv-python
 numpy
-Pillow
-qrcode[pil]
+opencv-python
+pillow
+pyvirtualcam
+qrcode
 zeroconf
