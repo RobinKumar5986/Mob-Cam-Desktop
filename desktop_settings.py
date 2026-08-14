@@ -25,6 +25,7 @@ DEFAULTS: Dict[str, Any] = {
     "show_preview": True,
     "virtual_camera": True,
     "segmenter_model": "selfie_landscape",
+    "mask_sharpness": 75,
     "device_serial": "",
     "window_geometry": "",
 }

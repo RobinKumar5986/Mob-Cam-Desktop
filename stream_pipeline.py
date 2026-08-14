@@ -36,6 +36,7 @@ class StreamPipeline:
         virtual_camera_enabled: bool = True,
         vcam_device: Optional[str] = None,
         segmenter_model: str = "selfie_landscape",
+        mask_sharpness: float = 0.75,
         on_preview_frame=None,
         on_connected=None,
         on_disconnected=None,
@@ -52,7 +53,8 @@ class StreamPipeline:
         self.on_vcam_error = on_vcam_error
         self.on_settings_received = on_settings_received
 
-        self.ai = AIEngine(segmenter_model=segmenter_model, on_status=on_ai_status)
+        self.ai = AIEngine(segmenter_model=segmenter_model, on_status=on_ai_status,
+                           mask_sharpness=mask_sharpness)
         self.config.ai = self.ai
 
         self.receiver = DataReceiver(
@@ -140,6 +142,10 @@ class StreamPipeline:
 
     def set_rotation(self, degrees: int) -> None:
         self.config.rotation = degrees
+
+    def set_mask_sharpness(self, sharpness: float) -> None:
+        """Live control over how hard the background-removal edge is."""
+        self.ai.set_mask_sharpness(sharpness)
 
     def set_output_size(self, width: int, height: int) -> None:
         """Change the output resolution; the device reopens on the next frame."""

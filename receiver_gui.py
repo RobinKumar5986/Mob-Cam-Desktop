@@ -230,6 +230,20 @@ class ConfigWindow:
             wraplength=430, justify="left",
         ).grid(row=0, column=1, columnspan=2, sticky="w", padx=8)
 
+        ttk.Label(phone_frame, text="Edge sharpness:").grid(
+            row=3, column=0, sticky="w", pady=(6, 0))
+        self.sharpness_var = tk.IntVar(
+            value=int(self.settings.get("mask_sharpness")))
+        ttk.Scale(
+            phone_frame, from_=0, to=100, orient="horizontal",
+            variable=self.sharpness_var, command=self._on_sharpness_changed,
+        ).grid(row=3, column=1, sticky="ew", padx=8, pady=(6, 0))
+        self.sharpness_label_var = tk.StringVar(
+            value=f"{self.sharpness_var.get()}%")
+        ttk.Label(
+            phone_frame, textvariable=self.sharpness_label_var, foreground="gray",
+        ).grid(row=3, column=2, sticky="w", pady=(6, 0))
+
         ttk.Label(phone_frame, text="Throughput:").grid(row=2, column=0, sticky="w", pady=(6, 0))
         self.stats_var = tk.StringVar(value="idle")
         ttk.Label(
@@ -333,9 +347,18 @@ class ConfigWindow:
             "show_preview": self.preview_var.get(),
             "virtual_camera": self.vcam_var.get(),
             "segmenter_model": self.selected_segmenter(),
+            "mask_sharpness": int(float(self.sharpness_var.get())),
             "device_serial": self.get_selected_serial() or self.settings.get("device_serial"),
         })
         self.settings.save()
+
+    def _on_sharpness_changed(self, _value=None):
+        """Hardens or softens the background-removal edge while streaming."""
+        value = int(float(self.sharpness_var.get()))
+        self.sharpness_label_var.set(f"{value}%")
+        if self.stream is not None:
+            self.stream.set_mask_sharpness(value / 100.0)
+        self._schedule_save()
 
     def selected_segmenter(self):
         """Model key for the chosen segmentation model."""
@@ -496,6 +519,7 @@ class ConfigWindow:
             fps=fps,
             virtual_camera_enabled=self.vcam_var.get(),
             segmenter_model=self.selected_segmenter(),
+            mask_sharpness=int(float(self.sharpness_var.get())) / 100.0,
             on_preview_frame=self._on_preview_frame,
             on_connected=lambda: self.root.after(0, self.on_stream_connected),
             on_disconnected=lambda: self.root.after(0, self.on_stream_disconnected),

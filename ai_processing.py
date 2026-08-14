@@ -59,6 +59,8 @@ MODEL_SPECS = {
 
 SEGMENT_INPUT_WIDTH = 256
 REFINE_MAX_WIDTH = 640
+SHARPEN_MAX_WIDTH = 0.60
+SHARPEN_MIN_WIDTH = 0.04
 FACE_INPUT_WIDTH = 320
 BLUR_DOWNSCALE_THRESHOLD = 15
 FACE_ZOOM_MARGIN = 2.5
@@ -139,17 +141,82 @@ def prefetch_models(keys=("selfie_landscape", "face_detector"), on_status=None,
     return results
 
 
+def sharpen_mask(mask: np.ndarray, sharpness: float = 0.75, feather: int = 1,
+                 cleanup: bool = True) -> np.ndarray:
+    """Turn a soft confidence mask into a decisive one with a thin soft edge.
+
+    A segmentation model outputs a probability per pixel, and using that
+    directly as alpha makes every uncertain pixel semi-transparent - the whole
+    subject washes out into the background. This remaps the probability so only
+    a narrow band around 0.5 stays partial: the interior goes fully opaque, the
+    background fully clear, and just a couple of pixels at the boundary keep the
+    soft ramp that hair and shoulders need.
+
+    sharpness  0 keeps the model's original ramp, 1 is nearly a hard cut
+    feather    radius in mask pixels of the remaining anti-aliased edge
+    cleanup    remove speckle and fill pinholes before feathering
+    """
+    sharpness = float(np.clip(sharpness, 0.0, 1.0))
+    width = SHARPEN_MAX_WIDTH - (SHARPEN_MAX_WIDTH - SHARPEN_MIN_WIDTH) * sharpness
+    low = 0.5 - width / 2.0
+    hardened = np.clip((mask - low) / width, 0.0, 1.0)
+
+    if cleanup:
+        kernel = np.ones((3, 3), np.uint8)
+        core = (hardened > 0.5).astype(np.uint8)
+        core = cv2.morphologyEx(core, cv2.MORPH_OPEN, kernel)
+        core = cv2.morphologyEx(core, cv2.MORPH_CLOSE, kernel)
+        # Only keep alpha next to a surviving region, which deletes the isolated
+        # low-confidence islands that read as haze in the background.
+        band = cv2.dilate(core, kernel, iterations=max(1, int(feather) + 1))
+        hardened = hardened * band.astype(np.float32)
+
+    if feather > 0:
+        size = int(feather) * 2 + 1
+        hardened = cv2.GaussianBlur(hardened, (size, size), 0)
+    return hardened
+
+
+_RECRISP_LUT: dict = {}
+
+
+def recrisp(mask: np.ndarray, strength: float) -> np.ndarray:
+    """Restore edge contrast lost when a mask is scaled up to frame size.
+
+    Applied through a cached 256-entry lookup table: the curve is fixed per
+    strength, so quantising the mask to 8 bits and looking it up is several
+    times faster than the equivalent float arithmetic at full frame size, and
+    the mask is quantised to 8 bits for compositing anyway.
+    """
+    if strength <= 0:
+        return mask
+
+    key = round(float(strength), 3)
+    lut = _RECRISP_LUT.get(key)
+    if lut is None:
+        levels = np.arange(256, dtype=np.float32) / 255.0
+        lut = np.clip((levels - 0.5) * (1.0 + 3.0 * key) + 0.5, 0.0, 1.0)
+        _RECRISP_LUT.clear()
+        _RECRISP_LUT[key] = lut
+
+    quantised = cv2.convertScaleAbs(mask, alpha=255.0)
+    return cv2.LUT(quantised, lut)
+
+
 # --------------------------------------------------------------- segmentation
 
 
 class SelfieSegmenter:
     """Wraps the MediaPipe ImageSegmenter and returns a smoothed person mask."""
 
-    def __init__(self, model_key: str = "selfie_landscape", smoothing: float = 0.6,
-                 refine_edges: bool = True):
+    def __init__(self, model_key: str = "selfie_landscape", smoothing: float = 0.35,
+                 refine_edges: bool = True, sharpness: float = 0.75,
+                 feather: int = 1):
         self.model_key = model_key
         self.smoothing = float(np.clip(smoothing, 0.0, 0.95))
         self.refine_edges = refine_edges
+        self.sharpness = float(np.clip(sharpness, 0.0, 1.0))
+        self.feather = max(0, int(feather))
         self.model_file = None
         self._segmenter = None
         self._previous_mask = None
@@ -225,7 +292,12 @@ class SelfieSegmenter:
                 )
                 person = self._refine(coarse, guide)
 
+            # Sharpened before the upscale: cheaper, and the morphology works on
+            # a scale where speckle is still speckle rather than blobs.
+            person = sharpen_mask(person, self.sharpness, self.feather)
+
             mask = cv2.resize(person, (width, height), interpolation=cv2.INTER_LINEAR)
+            mask = recrisp(mask, self.sharpness)
             np.nan_to_num(mask, copy=False, nan=0.0, posinf=1.0, neginf=0.0)
             return np.clip(mask, 0.0, 1.0)
 
@@ -569,8 +641,10 @@ def fit_background(background: np.ndarray, width: int, height: int) -> np.ndarra
 class AIEngine:
     """Owns the models and turns them on and off to match the phone's settings."""
 
-    def __init__(self, segmenter_model: str = "selfie_landscape", on_status=None):
-        self.segmenter = SelfieSegmenter(model_key=segmenter_model)
+    def __init__(self, segmenter_model: str = "selfie_landscape", on_status=None,
+                 mask_sharpness: float = 0.75):
+        self.segmenter = SelfieSegmenter(model_key=segmenter_model,
+                                         sharpness=mask_sharpness)
         self.face_tracker = FaceTracker()
         self.on_status = on_status
         self.last_error: Optional[str] = None
@@ -614,6 +688,10 @@ class AIEngine:
             self._background_cache = fit_background(image, width, height)
             self._background_key = key
         return self._background_cache
+
+    def set_mask_sharpness(self, sharpness: float) -> None:
+        """Live edge-hardness control, 0 soft to 1 nearly a hard cut."""
+        self.segmenter.sharpness = float(np.clip(sharpness, 0.0, 1.0))
 
     def reset(self) -> None:
         self.segmenter.reset()
