@@ -4,39 +4,53 @@ MOB CAM - PROJECT CONTEXT FOR AI
 SIMPLE RULES FOR CODE
 =====================
 1. Dont add bunch of uggly comments only add comments tellig what that func does.
-2. Keep Code Moduler so it will be easy to add new thing on top of the existing feature.
-3. Never Give Uncomplete code i.e if you are givine some change in a big file always give the complete function with the file name so I will be able to know where I have to replace/add the function.
-4. Always write the code in a way it won't break the old logic until it required to change the old logic.
-5. If for some change you need the code context of some other file ask the file before spittin any code.
+2. Keep Code Moduler so it will be easy to add new thing on top of the existing
+   feature.
+3. Never Give Uncomplete code i.e if you are givine some change in a big file
+   always give the complete function with the file name so I will be able to
+   know where I have to replace/add the function.
+4. Always write the code in a way it won't break the old logic until it required
+   to change the old logic.
+5. If for some change you need the code context of some other file ask the file
+   before spittin any code.
 6. Alwasy keep the code clean.
-7. Dont wast token for explaining each function and stuff only explain the function/code when I ask.
+7. Dont wast token for explaining each function and stuff only explain the
+   function/code when I ask.
+
 
 WHAT IT IS
-Android phone streams camera frames over USB (adb forward, TCP 4343) to a
-desktop Python app. The desktop processes them and publishes the result as a
-real OS camera device, so Zoom / Meet / Teams / browsers can pick it.
+Android phone streams camera frames over USB (adb forward, TCP 4343) and
+microphone audio (TCP 4344) to a desktop Python app. The desktop processes both
+and publishes them as a real OS camera device and a real OS microphone, so
+Zoom / Meet / Teams / OBS / browsers can pick either.
 
 "Use PC" toggle on the phone decides who does the work:
   OFF -> phone applies effects, desktop only does geometry
   ON  -> phone sends raw frames, desktop does all AI (faster, better quality)
 
-Phone is the TCP server. Desktop is the client.
+Mic toggle on the phone decides whether audio streams at all. Start Mob Cam
+starts both; mic off means video only.
+
+Phone is the TCP server on both ports. Desktop is the client.
 
 
 DESKTOP FILES (Python)
 ----------------------
-receiver_gui.py      Tk UI. Device picker, shape, resolution, fps, mirror,
-                     virtual-camera panel, AI status, throughput, edge-sharpness
-                     slider, preview window. Entry point: python receiver_gui.py
+receiver_gui.py      Tk UI in a scrollable frame. Device picker, shape,
+                     resolution, fps, mirror, virtual-camera panel, virtual-mic
+                     panel, AI status, throughput, level meter, edge-sharpness
+                     slider, preview window. Also owns the v4l2loopback
+                     load/reload helper. Entry point: python receiver_gui.py
 
-stream_pipeline.py   Wires everything together and owns the threads.
-                     StreamPipeline.start()/stop(), set_output_size(),
-                     set_mask_sharpness(), stats().
+stream_pipeline.py   Wires everything together and owns the threads, video and
+                     audio. StreamPipeline.start()/stop(), set_output_size(),
+                     set_mask_sharpness(), set_audio_*(), stats(),
+                     audio_stats().
 
 protocol.py          Wire format shared with the Java side. Message types,
-                     MessageReader, encode/decode helpers.
+                     MessageReader, encode/decode helpers. Serves both sockets.
 
-data_receiver.py     Reads the socket, drops stale frames, decodes JPEG,
+data_receiver.py     Reads the video socket, drops stale frames, decodes JPEG,
                      dispatches. Contains LatestSlot (depth-1 handoff).
 
 image_processing.py  The stage pipeline over BGR numpy frames. Stage order:
@@ -49,6 +63,19 @@ ai_processing.py     Segmentation + face tracking (MediaPipe), mask sharpening,
 virtual_camera.py    pyvirtualcam wrapper. Picks the backend per OS, opens the
                      device, conforms frames, reopen_at() for size changes.
 
+audio_receiver.py    Reads the audio socket, handles the format handshake,
+                     hands PCM chunks straight on. AudioFormat lives here.
+
+audio_processing.py  Stage pipeline over int16 PCM. Stage order: mute,
+                     dc_block, gain, limiter, meter. AudioConfig, AudioPipeline.
+
+audio_output.py      Writes PCM to the loopback device. Rate/channel
+                     negotiation and resampling, optional speaker monitor,
+                     PULSE_SINK targeting.
+
+virtual_mic.py       Creates and removes the virtual microphone via pactl
+                     (null-sink + remap-source). Per-OS setup instructions.
+
 remote_settings.py   Model of the phone's settings received in HELLO.
                      ARGB<->BGR conversion, ISO gain curve.
 
@@ -57,30 +84,38 @@ desktop_settings.py  Persists local UI preferences to ~/.mobcam/settings.json.
 adb_wifi.py          mDNS discovery for wireless adb pairing.
 adb_wifi_dialog.py   QR-code / pairing-code dialog.
 
-requirements.txt     numpy opencv-python pillow pyvirtualcam mediapipe
-                     qrcode zeroconf
+requirements.txt     numpy opencv-python pillow pyvirtualcam sounddevice
+                     mediapipe qrcode zeroconf
 
 
 ANDROID FILES (Java, package com.kgjr.mobcam)
 ---------------------------------------------
 fragmets/MobCamFragment.java        Main screen: preview, Start/Stop, Use PC
-                                    toggle, Dim, flip, FPS readout.
+                                    toggle, mic toggle, Dim, flip, FPS readout.
 fragmets/SettingFragment.java       Effect and colour controls.
-helpers/FrameStreamer.java          TCP server, framing, handshake, ACK reader.
+helpers/FrameStreamer.java          Video TCP server, framing, handshake, ACK.
+helpers/AudioStreamer.java          Audio TCP server on 4344, AudioRecord
+                                    capture, PCM framing, AEC/NS/AGC.
+helpers/AudioFormatOption.java      The four capture formats offered.
 helpers/ConfigPayload.java          Builds the HELLO JSON + background JPEG.
 helpers/RawFrameEncoder.java        PC-mode fast path, rotates NV21 directly.
 helpers/FrameRateLimiter.java       Frame pacing towards the target fps.
 helpers/ImageProcessor.java         Phone-side effects.
 helpers/CameraHelper.java           CameraX setup.
 helpers/FaceHeadLockProcessor.java  ML Kit face detect for head-lock.
-localDb/SettingSharePreference.java SharedPreferences, includes use_pc.
+localDb/SettingSharePreference.java SharedPreferences: use_pc, mic_enabled,
+                                    audio_format.
 res/layout/fragment_mob_cam.xml     Main screen layout.
+
+Permissions: CAMERA, RECORD_AUDIO, MODIFY_AUDIO_SETTINGS, INTERNET.
+Drawables mic_on / mic_off and string mic_toggle are required by the layout.
 
 
 PROTOCOL
 --------
 message = [1 byte type][4 bytes big-endian length][payload]
 
+Video socket, port 4343:
 0x01 HELLO      phone->PC  JSON, all settings, includes usePc, hasBackground
 0x02 BACKGROUND phone->PC  JPEG of the selected background
 0x03 ACK        PC->phone  JSON, mode + output size + AI status
@@ -88,16 +123,29 @@ message = [1 byte type][4 bytes big-endian length][payload]
 0x05 SETTINGS   phone->PC  JSON, partial live update
 0x06 BYE        either     empty
 
-Handshake: HELLO -> (BACKGROUND) -> ACK -> then frames. Phone starts anyway
-after 4s if no ACK. A leading 0x00 means an old bare-JPEG stream (still read).
+Audio socket, port 4344:
+0x01 HELLO      phone->PC  JSON, sampleRate, channels, encoding, chunkBytes
+0x03 ACK        PC->phone  JSON, output device is open
+0x07 AUDIO      phone->PC  raw PCM, 20 ms chunk
+0x06 BYE        either     empty
+
+Video handshake: HELLO -> (BACKGROUND) -> ACK -> then frames. Phone starts
+anyway after 4s if no ACK. A leading 0x00 means an old bare-JPEG stream
+(still read).
+Audio handshake: HELLO -> ACK -> then chunks. Phone starts anyway after 3s.
+
+Audio is a second socket, not a message type on 4343, so a 20 ms chunk never
+queues behind an in-flight JPEG.
 
 
 THREADS
 -------
 Tk main          all UI, must never block on socket or driver calls
-data-receiver    reads the socket only
-frame-processor  decodes and runs the pipeline
-virtual-camera   sends to the device, owns device reopens
+data-receiver    reads the video socket only
+frame-processor  decodes and runs the image pipeline
+virtual-camera   sends to the camera device, owns device reopens
+audio-receiver   reads the audio socket, runs the audio pipeline inline
+PortAudio cb     pulls from the audio ring, owned by sounddevice
 
 
 RULES THAT MATTER
@@ -111,7 +159,14 @@ RULES THAT MATTER
 6. Copy MediaPipe numpy_view() output; it aliases memory the library reuses.
 7. Use even pixel dimensions.
 8. HELLO keys must match between ConfigPayload.java and remote_settings.py.
-9. A failing pipeline stage must be skipped, not fatal.
+9. A failing pipeline stage must be skipped, not fatal. Same for audio stages.
+10. Audio buffer stays at 80 ms; drop the oldest bytes rather than queueing.
+    Late audio is worse than missing audio.
+11. Audio stages run inline on the receiver thread. No thread hop, no queue.
+12. Camera and mic are independent devices. Neither failure path may disable
+    the other.
+13. A device probe failure is not a user preference. Never persist a toggle
+    that was turned off by a failed probe or a runtime error.
 
 
 SETUP
@@ -120,14 +175,47 @@ python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 python receiver_gui.py
 
-Needs a loopback camera driver:
+sounddevice needs PortAudio. Bundled on Windows and macOS; on Debian/Ubuntu
+run: sudo apt install libportaudio2
+
+Camera device (loopback driver):
   Windows / macOS  install OBS Studio, launch once
   Linux            sudo modprobe v4l2loopback devices=1 video_nr=10 \
                      card_label='Mob Cam' exclusive_caps=1
                    (exclusive_caps=1 required or browsers won't list it)
+                   The 'Load driver' button in the GUI does this via pkexec.
+
+Microphone device:
+  Windows          VB-CABLE. Send to 'CABLE Input', app records 'CABLE Output'
+  macOS            BlackHole 2ch, both sides
+  Linux            'Create virtual mic' button, or:
+                     pactl load-module module-null-sink sink_name=mobcam_sink \
+                       sink_properties=device.description=Mob_Cam_Output
+                     pactl load-module module-remap-source \
+                       master=mobcam_sink.monitor source_name=mobcam_mic \
+                       source_properties=device.description=Mob_Cam_Microphone
+                   App then records from 'Mob Cam Microphone'.
 
 AI models auto-download to ~/.mobcam/models, or drop .tflite files in a
 models/ folder next to the scripts. Inference is fully local.
+
+
+GOTCHAS THAT COST TIME
+----------------------
+- modprobe will not change the options of an already loaded module. To add
+  exclusive_caps you must modprobe -r first. Symptom: camera works in OBS,
+  invisible in Chrome / Meet.
+- v4l2loopback does not survive a reboot unless made permanent in
+  /etc/modules-load.d and /etc/modprobe.d.
+- Chrome enumerates cameras only on page load. Start Mob Cam before opening or
+  reloading the Meet tab.
+- PortAudio exposes PulseAudio as one 'pulse' device that follows the default
+  sink, which is the speakers. PULSE_SINK is set per stream to steer the mic
+  path onto the Mob Cam sink.
+- A bare null-sink only gives 'Monitor of ...', which most apps hide. The
+  remap-source is what makes it look like a normal microphone.
+- Sound cards usually accept only 44.1 / 48 kHz. audio_output resamples, so
+  the phone can stay on 16 kHz.
 
 
 KNOWN OPEN ISSUES
@@ -140,6 +228,12 @@ KNOWN OPEN ISSUES
 - Android ImageProcessor.applyBlur is a stub, so blur only works in PC mode.
 - opencv-contrib-python would enable guided-filter edge refinement (sharper
   hair edges) instead of the bilateral fallback.
+- Audio resampling is linear interpolation. Fine for speech, not for music.
+- Changing the audio format mid-stream restarts the audio socket; the desktop
+  cannot renegotiate its output device live.
+- Not yet confirmed whether the pixel format pyvirtualcam opens with is the
+  one browsers prefer. If Meet still refuses a correctly loaded device, check
+  the fmt argument in virtual_camera.py.
 
 
 TESTS
@@ -147,8 +241,11 @@ TESTS
 Plain scripts in the project dir, no framework:
   test_full, test_phone_mode, test_fixes, test_realtime, test_before_after,
   test_sharpness, test_resize, test_settings, test_download, test_nv21,
-  test_ratelimit, test_gui_persist (needs a display)
+  test_ratelimit, test_gui_persist (needs a display), test_audio
 Run: python3 test_full.py    etc.
+
+test_audio runs a fake phone on 4344 streaming a tone through the real
+receiver and output path. --server leaves it running for the real GUI.
 
 
 CODE STYLE
