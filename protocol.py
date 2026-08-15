@@ -3,6 +3,10 @@
 Message layout:
     [1 byte type][4 bytes big-endian payload length][payload]
 
+Two sockets carry the stream. Video runs on PORT, audio on AUDIO_PORT, both
+forwarded by adb. The framing and the reader are identical; only the message
+types differ, so MessageReader serves both.
+
 Legacy streams (older APKs that sent bare length-prefixed JPEGs) are still
 readable: a legacy frame starts with the high byte of a 4-byte length, which is
 0x00 for any frame under 16 MB, and 0x00 is not a valid message type.
@@ -15,6 +19,7 @@ import socket
 import struct
 
 PORT = 4343
+AUDIO_PORT = 4344
 PROTOCOL_VERSION = 1
 
 TYPE_LEGACY_FRAME = 0x00
@@ -24,6 +29,11 @@ TYPE_ACK = 0x03
 TYPE_FRAME = 0x04
 TYPE_SETTINGS = 0x05
 TYPE_BYE = 0x06
+TYPE_AUDIO = 0x07
+
+# The audio socket reuses HELLO for its format announcement, so it is only an
+# alias; the two never share a connection.
+TYPE_AUDIO_HELLO = TYPE_HELLO
 
 TYPE_NAMES = {
     TYPE_LEGACY_FRAME: "LEGACY_FRAME",
@@ -33,6 +43,7 @@ TYPE_NAMES = {
     TYPE_FRAME: "FRAME",
     TYPE_SETTINGS: "SETTINGS",
     TYPE_BYE: "BYE",
+    TYPE_AUDIO: "AUDIO",
 }
 
 MAX_PAYLOAD_BYTES = 32 * 1024 * 1024

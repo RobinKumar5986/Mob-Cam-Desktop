@@ -2,13 +2,22 @@
 
 Owns the whole chain and hides the threading from the UI:
 
-    DataReceiver -> ProcessingPipeline (+ AIEngine) -> VirtualCamera
-                                                   \\-> preview callback
+    DataReceiver  -> ProcessingPipeline (+ AIEngine) -> VirtualCamera
+                                                    \\-> preview callback
+    AudioReceiver -> AudioPipeline -> AudioOutput -> virtual microphone
+                                                 \\-> optional speaker monitor
+
+The two halves mirror each other: receive, run a stage pipeline, publish as an
+OS device other applications can select.
 
 The virtual camera runs on its own sender thread behind a depth-1 queue, so a
 slow driver drops frames instead of stalling the socket reader. The receiver
 does the same one stage earlier, so nothing anywhere in the chain queues more
 than one frame and the output stays in real time.
+
+Audio is a second socket on its own port and never shares a thread with the
+video path: a chunk queued behind a JPEG would arrive one frame time late, and
+lip sync is the whole point.
 """
 
 from __future__ import annotations
@@ -19,10 +28,14 @@ import time
 from typing import Optional
 
 from ai_processing import AIEngine
+from audio_output import AudioOutput, AudioOutputError
+from audio_processing import AudioConfig, AudioPipeline
+from audio_receiver import AudioReceiver
 from data_receiver import DEFAULT_PORT, DataReceiver
 from image_processing import (
     ProcessingConfig, ProcessingPipeline, build_pipeline, even_size,
 )
+from protocol import AUDIO_PORT
 from remote_settings import RemoteSettings
 from virtual_camera import VirtualCamera, VirtualCameraError
 
@@ -37,6 +50,12 @@ class StreamPipeline:
         vcam_device: Optional[str] = None,
         segmenter_model: str = "selfie_landscape",
         mask_sharpness: float = 0.75,
+        audio_enabled: bool = True,
+        audio_port: int = AUDIO_PORT,
+        audio_device: Optional[str] = None,
+        audio_monitor: bool = False,
+        audio_gain_db: float = 0.0,
+        audio_mute: bool = False,
         on_preview_frame=None,
         on_connected=None,
         on_disconnected=None,
@@ -44,6 +63,8 @@ class StreamPipeline:
         on_vcam_error=None,
         on_settings_received=None,
         on_ai_status=None,
+        on_audio_status=None,
+        on_audio_error=None,
     ):
         self.config = config or ProcessingConfig()
         self.pipeline: ProcessingPipeline = build_pipeline(self.config)
@@ -52,6 +73,8 @@ class StreamPipeline:
         self.on_vcam_status = on_vcam_status
         self.on_vcam_error = on_vcam_error
         self.on_settings_received = on_settings_received
+        self.on_audio_status = on_audio_status
+        self.on_audio_error = on_audio_error
 
         self.ai = AIEngine(segmenter_model=segmenter_model, on_status=on_ai_status,
                            mask_sharpness=mask_sharpness)
@@ -79,6 +102,23 @@ class StreamPipeline:
         self._pending_device_size: Optional[tuple] = None
         self.camera.pad_color = self.config.background
 
+        self._audio_enabled = audio_enabled
+        self._audio_failed = False
+        self._audio_channels = 1
+        self.audio_pipeline = AudioPipeline(
+            AudioConfig(gain_db=audio_gain_db, mute=audio_mute))
+        self.audio_output = AudioOutput(
+            device=audio_device, monitor=audio_monitor,
+            on_status=self._emit_audio_status, on_error=self._emit_audio_error,
+        )
+        self.audio_receiver = AudioReceiver(
+            port=audio_port,
+            on_chunk=self._handle_audio_chunk,
+            on_format=self._handle_audio_format,
+            on_connected=lambda: self._emit_audio_status("Phone mic connected"),
+            on_disconnected=self._handle_audio_disconnected,
+        )
+
         self.frames_dropped = 0
         self._process_seconds = 0.0
         self._processed = 0
@@ -88,9 +128,10 @@ class StreamPipeline:
     # ----------------------------------------------------------- lifecycle
 
     def start(self) -> None:
-        """Start the receiver and, if enabled, the virtual camera sender."""
+        """Start the receivers and, if enabled, the virtual camera sender."""
         self._stop_event.clear()
         self._vcam_failed = False
+        self._audio_failed = False
         self.camera.request_size(*even_size(self.config.output_size))
         self._process_seconds = 0.0
         self._processed = 0
@@ -99,11 +140,16 @@ class StreamPipeline:
         if self._vcam_enabled:
             self._start_vcam_thread()
         self.receiver.start()
+        if self._audio_enabled:
+            self.audio_receiver.start()
+            self._emit_audio_status("Waiting for the phone mic...")
 
     def stop(self) -> None:
-        """Tear everything down, releasing the device and the AI models."""
+        """Tear everything down, releasing the devices and the AI models."""
         self._stop_event.set()
         self.receiver.stop()
+        self.audio_receiver.stop()
+        self.audio_output.close()
         self._drain_vcam_queue()
         thread = self._vcam_thread
         if thread is not None and thread is not threading.current_thread():
@@ -117,6 +163,10 @@ class StreamPipeline:
     @property
     def virtual_camera_enabled(self) -> bool:
         return self._vcam_enabled
+
+    @property
+    def audio_enabled(self) -> bool:
+        return self._audio_enabled
 
     @property
     def settings(self) -> RemoteSettings:
@@ -135,6 +185,29 @@ class StreamPipeline:
             self._drain_vcam_queue()
             self.camera.close()
             self._emit_vcam_status("off")
+
+    def set_audio_enabled(self, enabled: bool) -> None:
+        """Turn the microphone path on or off without touching the video."""
+        if enabled == self._audio_enabled:
+            return
+        self._audio_enabled = enabled
+        if enabled:
+            self._audio_failed = False
+            self.audio_receiver.start()
+            self._emit_audio_status("Waiting for the phone mic...")
+        else:
+            self.audio_receiver.stop()
+            self.audio_output.close()
+            self._emit_audio_status("off")
+
+    def set_audio_device(self, device: Optional[str]) -> None:
+        """Switch the loopback device the microphone audio is written to."""
+        self._audio_failed = False
+        self.audio_output.set_device(device)
+
+    def set_audio_monitor(self, enabled: bool) -> None:
+        """Play the phone audio on the local speakers as well."""
+        self.audio_output.set_monitor(enabled)
 
     def set_shape(self, shape: str) -> None:
         self.config.shape = shape
@@ -196,8 +269,66 @@ class StreamPipeline:
             "outputWidth": width,
             "outputHeight": height,
             "virtualCamera": self._vcam_enabled,
+            "audio": self._audio_enabled,
             "ai": self.ai.status(),
             "aiError": self.ai.last_error or "",
+        }
+
+    # ----------------------------------------------------------- audio path
+
+    def _handle_audio_format(self, audio_format) -> None:
+        """Open the output device to match the format the phone announced.
+
+        Runs on the audio reader thread, before the ACK is sent, so the device is
+        already live by the time the first chunk arrives.
+        """
+        self._audio_channels = audio_format.channels
+        self.audio_pipeline.reset()
+        try:
+            self.audio_output.open(audio_format)
+            self._audio_failed = False
+        except AudioOutputError as exc:
+            self._audio_failed = True
+            self._emit_audio_error(str(exc))
+
+    def _handle_audio_chunk(self, pcm: bytes) -> None:
+        """Run one chunk through the stages and hand it to the output.
+
+        Done inline on the reader thread on purpose. The stages are a few
+        microseconds on a 20 ms chunk, and a thread hop here would mean a queue,
+        which is the one thing this path must not have.
+        """
+        if self._audio_failed:
+            return
+        self.audio_output.feed(
+            self.audio_pipeline.process(pcm, self._audio_channels))
+
+    def _handle_audio_disconnected(self) -> None:
+        self.audio_output.close()
+        self.audio_pipeline.reset()
+        if self._audio_enabled:
+            self._emit_audio_status("Phone mic disconnected")
+
+    def set_audio_gain_db(self, gain_db: float) -> None:
+        """Live gain trim on the microphone signal."""
+        self.audio_pipeline.set_gain_db(gain_db)
+
+    def set_audio_mute(self, mute: bool) -> None:
+        """Mute at the pipeline, so the device stays open and apps see silence."""
+        self.audio_pipeline.set_mute(mute)
+
+    def audio_stats(self) -> dict:
+        """Current audio state for the UI."""
+        fmt = self.audio_receiver.audio_format
+        level = self.audio_pipeline.level()
+        return {
+            "connected": self.audio_receiver.is_connected,
+            "format": str(fmt) if fmt else "",
+            "chunks": self.audio_receiver.chunks_received,
+            "underruns": self.audio_output.underruns,
+            "peak": level["peak"],
+            "rms": level["rms"],
+            "processing": self.audio_pipeline.config.summary(),
         }
 
     # ---------------------------------------------------------- frame path
@@ -315,6 +446,12 @@ class StreamPipeline:
 
     def _emit_vcam_error(self, message: str) -> None:
         self._safe(self.on_vcam_error, message)
+
+    def _emit_audio_status(self, message: str) -> None:
+        self._safe(self.on_audio_status, message)
+
+    def _emit_audio_error(self, message: str) -> None:
+        self._safe(self.on_audio_error, message)
 
     def _emit_settings(self, settings: RemoteSettings) -> None:
         self._safe(self.on_settings_received, settings)

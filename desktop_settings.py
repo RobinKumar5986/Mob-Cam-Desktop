@@ -28,6 +28,11 @@ DEFAULTS: Dict[str, Any] = {
     "mask_sharpness": 75,
     "device_serial": "",
     "window_geometry": "",
+    "audio_enabled": True,
+    "audio_device": "",
+    "audio_monitor": False,
+    "audio_gain": 0,
+    "audio_mute": False,
 }
 
 

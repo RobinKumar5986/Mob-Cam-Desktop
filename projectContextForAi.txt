@@ -1,6 +1,16 @@
 MOB CAM - PROJECT CONTEXT FOR AI
 ================================
 
+SIMPLE RULES FOR CODE
+=====================
+1. Dont add bunch of uggly comments only add comments tellig what that func does.
+2. Keep Code Moduler so it will be easy to add new thing on top of the existing feature.
+3. Never Give Uncomplete code i.e if you are givine some change in a big file always give the complete function with the file name so I will be able to know where I have to replace/add the function.
+4. Always write the code in a way it won't break the old logic until it required to change the old logic.
+5. If for some change you need the code context of some other file ask the file before spittin any code.
+6. Alwasy keep the code clean.
+7. Dont wast token for explaining each function and stuff only explain the function/code when I ask.
+
 WHAT IT IS
 Android phone streams camera frames over USB (adb forward, TCP 4343) to a
 desktop Python app. The desktop processes them and publishes the result as a
