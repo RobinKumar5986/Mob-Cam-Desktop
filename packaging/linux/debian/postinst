@@ -1,0 +1,10 @@
+#!/bin/sh
+set -e
+chmod +x /usr/lib/mobcam/mobcam || true
+echo ""
+echo "Mob Cam installed."
+echo "A virtual camera driver is required and is not installed by this package."
+echo "Load one with:"
+echo "  sudo modprobe v4l2loopback devices=1 video_nr=10 card_label='Mob Cam' exclusive_caps=1"
+echo "Or use the 'Load driver' button inside the app."
+exit 0

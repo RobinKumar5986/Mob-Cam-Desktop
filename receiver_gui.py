@@ -13,6 +13,7 @@ microphone, so Zoom / Meet / Teams / OBS / browsers list both sources.
 
 import os
 import platform
+import sys
 import re
 import shutil
 import subprocess
@@ -42,6 +43,16 @@ from virtual_camera import current_os, probe, setup_instructions
 PORT = DEFAULT_PORT
 AUDIO_STREAM_PORT = AUDIO_PORT
 BG_KEY_COLOR = "#00FF00"
+
+def resource_path(filename: str) -> str:
+    """Path to a bundled file, correct both from source and when packaged.
+
+    PyInstaller sets sys._MEIPASS to the folder holding bundled data files
+    (logo.png among them). Running from source, that attribute does not
+    exist, so this falls back to the folder this script lives in.
+    """
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, filename)
 
 RESOLUTIONS = [
     ("1080 x 1080 (square)", (1080, 1080)),
@@ -296,6 +307,14 @@ class ConfigWindow:
         # to be wide enough for the widest row, not tall enough for everything.
         self.root.minsize(640, 320)
         self.root.protocol("WM_DELETE_WINDOW", self.on_app_close)
+
+        # Kept as an attribute so Tk does not garbage-collect the image once
+        # this call returns; a local variable here would show a blank icon.
+        try:
+            self._icon_image = tk.PhotoImage(file=resource_path("logo.png"))
+            self.root.iconphoto(True, self._icon_image)
+        except tk.TclError as exc:
+            print(f"[receiver_gui] could not set window icon: {exc}")
 
         self.settings = DesktopSettings.load()
         self.root.geometry(self._start_geometry())
@@ -1423,7 +1442,10 @@ class HelpWindow(tk.Toplevel):
 
 
 def main():
-    root = tk.Tk()
+    # className sets WM_CLASS, which GNOME matches against a .desktop file's
+    # StartupWMClass to pick the correct dock/taskbar icon. Without this the
+    # window is unidentifiable and GNOME falls back to a generic icon.
+    root = tk.Tk(className="mobcam")
     ConfigWindow(root)
     root.mainloop()
 

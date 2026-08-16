@@ -2,6 +2,7 @@ numpy
 opencv-python
 pillow
 pyvirtualcam
+sounddevice
 mediapipe
 qrcode
 zeroconf

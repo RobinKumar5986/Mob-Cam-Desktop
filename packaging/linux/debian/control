@@ -1,0 +1,12 @@
+Package: mobcam
+Version: VERSION_PLACEHOLDER
+Section: video
+Priority: optional
+Architecture: amd64
+Depends: libportaudio2
+Recommends: v4l2loopback-dkms
+Maintainer: Robin Kumar <rkrobin6550@gmail.com>
+Description: Turn your Android phone into a webcam and microphone
+ Mob Cam streams your phone's camera and microphone to this desktop over
+ USB or Wi-Fi and publishes them as a real system camera and microphone
+ that Zoom, Meet, Teams, OBS, and any browser can pick up

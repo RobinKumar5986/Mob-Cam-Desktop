@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Mob Cam
+Comment=Turn your Android phone into a webcam and microphone
+Exec=mobcam
+Icon=mobcam
+Categories=AudioVideo;Video;
+Terminal=false
+StartupWMClass=mobcam
