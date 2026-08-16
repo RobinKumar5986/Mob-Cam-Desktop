@@ -26,6 +26,7 @@ from PIL import Image, ImageTk
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
 
+from adb_wifi import try_reconnect
 from adb_wifi_dialog import WifiPairDialog
 import ai_processing
 import audio_output
@@ -350,6 +351,7 @@ class ConfigWindow:
 
         self._build_ui()
         self.refresh_devices()
+        self.try_reconnect_wifi()
         self.check_virtual_camera()
         self.check_audio()
         self.prefetch_models()
@@ -1045,7 +1047,48 @@ class ConfigWindow:
         self.root.after(0, self.refresh_devices)
 
     def pair_wifi(self):
-        WifiPairDialog(self.root, on_paired=self.refresh_devices)
+        WifiPairDialog(self.root, on_paired=self.on_wifi_paired)
+
+    def on_wifi_paired(self, address=None):
+        """Called once a wireless pairing dialog actually connects."""
+        if address:
+            self.settings.set("last_wifi_address", address)
+            self.settings.save()
+        self.refresh_devices()
+
+    def try_reconnect_wifi(self):
+        """Best-effort reconnect to the last wireless device, on launch only.
+
+        Runs off the Tk thread since it shells out to adb and may block on
+        mDNS discovery. Silent on failure - this is a convenience, not
+        something that should interrupt startup with an error dialog.
+        """
+        address = self.settings.get("last_wifi_address")
+        if not address:
+            return
+        self.status_var.set(f"Reconnecting to {address}...")
+        threading.Thread(
+            target=self._reconnect_wifi_worker, args=(address,), daemon=True
+        ).start()
+
+    def _reconnect_wifi_worker(self, address):
+        try_reconnect(
+            address,
+            lambda ok, addr: self.root.after(0, lambda: self._on_wifi_reconnected(ok, addr)),
+        )
+
+    def _on_wifi_reconnected(self, ok, address):
+        if not ok:
+            # Leave the saved address alone - the phone may just be off or out
+            # of range right now, not permanently gone.
+            if not self._devices:
+                self.status_var.set("No devices found")
+            return
+        if address and address != self.settings.get("last_wifi_address"):
+            self.settings.set("last_wifi_address", address)
+            self.settings.save()
+        self.refresh_devices()
+        self.status_var.set(f"Reconnected wirelessly to {address}")
 
     # ------------------------------------------------------------- stream
 

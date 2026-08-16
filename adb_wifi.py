@@ -9,6 +9,8 @@ type an IP address:
   * Connect     - _adb-tls-connect._tcp is advertised continuously while
                   wireless debugging is on, which gives us the host:port to
                   `adb connect` without asking for it.
+  * Reconnect   - on app start we retry the last address that worked, so the
+                  user does not have to re-pair every launch.
 """
 
 import random
@@ -99,3 +101,36 @@ def wait_for_connect_service(on_found, timeout=15):
     # advertised continuously while wireless debugging is on, gives us the
     # host:port to `adb connect` without asking the user for it
     _browse_until_found(CONNECT_SERVICE, "", on_found, timeout)
+
+
+def try_reconnect(last_address, on_result, discovery_timeout=5):
+    """Best-effort restore of a previously paired wireless connection.
+
+    Tries a direct `adb connect` at the saved host:port first, since the port
+    usually stays valid across app restarts as long as the phone was not
+    rebooted. If that fails, falls back to a short mDNS browse for the connect
+    service - it is advertised continuously while wireless debugging is on -
+    and connects to whatever address turns up.
+
+    Calls on_result(ok, address) once, from whatever thread this was called
+    on. address is the one that actually worked, or None on failure. Never
+    raises; adb or mDNS being unavailable just means reconnect fails quietly.
+    """
+    if not last_address:
+        on_result(False, None)
+        return
+
+    ok, _ = run_adb("connect", last_address)
+    if ok:
+        on_result(True, last_address)
+        return
+
+    def _on_found(host, port):
+        if host is None:
+            on_result(False, None)
+            return
+        address = f"{host}:{port}"
+        ok2, _ = run_adb("connect", address)
+        on_result(ok2, address if ok2 else None)
+
+    _browse_until_found(CONNECT_SERVICE, "", _on_found, discovery_timeout)

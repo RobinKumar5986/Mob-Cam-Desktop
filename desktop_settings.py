@@ -33,6 +33,7 @@ DEFAULTS: Dict[str, Any] = {
     "audio_monitor": False,
     "audio_gain": 0,
     "audio_mute": False,
+    "last_wifi_address": "",
 }
 
 

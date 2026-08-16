@@ -27,6 +27,9 @@ DEFAULT_COLOR = "gray"
 
 class WifiPairDialog(tk.Toplevel):
     def __init__(self, parent, on_paired=None):
+        """on_paired, if given, is called as on_paired(address) with the
+        'host:port' string that was just connected, once adb connect succeeds.
+        """
         super().__init__(parent)
         self.title("Pair over WiFi")
         self.geometry("360x460")
@@ -179,11 +182,12 @@ class WifiPairDialog(tk.Toplevel):
             self._set_both("Paired, but couldn't auto-detect the connect address.")
             return
 
-        ok, output = run_adb("connect", f"{host}:{port}")
+        address = f"{host}:{port}"
+        ok, output = run_adb("connect", address)
         if ok:
-            self._set_both(f"✔ Connected to {host}:{port}", CONNECTED_COLOR, big=True)
+            self._set_both(f"✔ Connected to {address}", CONNECTED_COLOR, big=True)
             if self.on_paired:
-                self.on_paired()
+                self.on_paired(address)
         else:
             messagebox.showerror("Connect failed", output)
 
