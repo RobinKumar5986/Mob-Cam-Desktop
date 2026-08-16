@@ -1,0 +1,528 @@
+MOB CAM - BUILD & PACKAGING CONTEXT FOR AI
+===========================================
+This file documents how the Mob Cam desktop app (Python, Tk GUI) is packaged
+into installable applications. Pair this with projectContextForAi.txt (the
+app's own architecture doc) when asking an AI for help - that file explains
+what the app does, this file explains how it gets turned into something a
+non-technical user can download and run.
+
+STATUS: Linux packaging is complete and tested (AppImage + .deb).
+Windows and macOS packaging have NOT been started yet.
+
+GOAL
+----
+Ship Mob Cam as a normal downloadable application per OS, the way DroidCam or
+OBS are distributed - no "install Python" step for the end user. Virtual
+camera / microphone drivers (v4l2loopback, OBS virtualcam, VB-CABLE,
+BlackHole) stay a manual, separate step for the user. The packaging never
+installs or touches those drivers automatically - see "MISTAKE WE MADE AND
+FIXED" below for why that rule exists.
+
+TOOLCHAIN USED (Linux)
+-----------------------
+PyInstaller  - bundles the Python app + all dependencies into a standalone
+               executable folder (--onedir build), no Python install needed
+               by the end user.
+AppImage     - wraps the PyInstaller output into a single executable file.
+               No install step: user runs `chmod +x` then double-clicks or
+               runs it directly.
+dpkg-deb     - wraps the PyInstaller output into a .deb package. User runs
+               `sudo apt install ./mobcam_x.x.x_amd64.deb`, apt resolves
+               dependencies (e.g. libportaudio2) automatically.
+
+Both formats are produced from the SAME PyInstaller build in one command.
+
+
+PROJECT FILE STRUCTURE (packaging-related files only)
+-------------------------------------------------------
+Mob Cam/                              <- project root
+├── requirements.txt                  App runtime dependencies (existing file)
+├── requirements-build.txt            Build-only dependency: pyinstaller
+├── mobcam.spec                       PyInstaller build spec
+├── build_linux.sh                    One command that runs the whole Linux
+│                                      build: PyInstaller -> AppImage -> .deb
+├── logo.png                          App icon (existing file, used by spec
+│                                      and by both packaging scripts)
+├── .gitignore                        Excludes venv/, build/, dist/, and
+│                                      packaging output from git
+└── packaging/
+    └── linux/
+        ├── mobcam.desktop            Linux desktop-entry file (app menu /
+        │                             taskbar metadata)
+        ├── build_appimage.sh         Wraps dist/mobcam into an AppImage
+        ├── build_deb.sh              Wraps dist/mobcam into a .deb
+        ├── debian/
+        │   ├── control               .deb metadata: name, version, deps
+        │   └── postinst               Script that runs after `apt install`,
+        │                              prints the v4l2loopback instructions
+        ├── build/                    (gitignored) scratch folder used during
+        │                             build - AppDir, .deb staging, cached
+        │                             appimagetool download
+        └── output/                   (gitignored) final build artifacts land
+                                       here: the .AppImage and the .deb
+
+
+FULL CONTENTS OF EACH FILE
+----------------------------
+
+--- requirements-build.txt ---
+pyinstaller>=6.0
+
+
+--- mobcam.spec ---
+# PyInstaller build spec for the Mob Cam desktop app (Linux onedir build).
+# Entry point is receiver_gui.py. Bundles mediapipe/cv2/pyvirtualcam/sounddevice
+# data files, which normal PyInstaller hidden-import detection misses.
+
+from PyInstaller.utils.hooks import collect_all
+
+block_cipher = None
+
+datas = [('logo.png', '.')]
+binaries = []
+hidden_imports = ['PIL._tkinter_finder']
+
+for pkg in ('mediapipe', 'cv2', 'pyvirtualcam', 'sounddevice', 'zeroconf', 'qrcode'):
+    pkg_datas, pkg_binaries, pkg_hidden = collect_all(pkg)
+    datas += pkg_datas
+    binaries += pkg_binaries
+    hidden_imports += pkg_hidden
+
+a = Analysis(
+    ['receiver_gui.py'],
+    pathex=[],
+    binaries=binaries,
+    datas=datas,
+    hiddenimports=hidden_imports,
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[],
+    noarchive=False,
+    cipher=block_cipher,
+)
+
+pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    [],
+    exclude_binaries=True,
+    name='mobcam',
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=False,
+    console=False,
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=False,
+    upx_exclude=[],
+    name='mobcam',
+)
+
+NOTE: hidden_imports starts with 'PIL._tkinter_finder' - PIL.ImageTk looks
+this up dynamically at runtime, so PyInstaller's static scanner never finds
+it on its own. Without this line, the app builds and launches fine, but
+crashes the instant it tries to render anything through ImageTk.PhotoImage -
+which in this app means the camera preview window and the WiFi-pairing QR
+code both silently fail. See "BUGS WE HIT" below for the exact symptom.
+
+
+--- packaging/linux/mobcam.desktop ---
+[Desktop Entry]
+Type=Application
+Name=Mob Cam
+Comment=Turn your Android phone into a webcam and microphone
+Exec=mobcam
+Icon=mobcam
+Categories=AudioVideo;Video;
+Terminal=false
+StartupWMClass=mobcam
+
+NOTE: StartupWMClass=mobcam must match the className passed to tk.Tk() in
+receiver_gui.py's main() function (see "CODE CHANGES REQUIRED IN THE APP
+ITSELF" below). Without both sides matching, GNOME (and most Linux desktop
+environments) cannot associate the running window with this .desktop file,
+and falls back to showing a generic icon in the taskbar/dock/alt-tab, even
+though the window's own title bar icon is fine.
+
+
+--- packaging/linux/debian/control ---
+Package: mobcam
+Version: VERSION_PLACEHOLDER
+Section: video
+Priority: optional
+Architecture: amd64
+Depends: libportaudio2
+Maintainer: Robin Kumar <rkrobin6550@gmail.com>
+Description: Turn your Android phone into a webcam and microphone
+ Mob Cam streams your phone's camera and microphone to this desktop over
+ USB or Wi-Fi and publishes them as a real system camera and microphone
+ that Zoom, Meet, Teams, OBS, and any browser can pick up.
+
+IMPORTANT: VERSION_PLACEHOLDER is replaced automatically by build_deb.sh at
+build time (via sed) - never hand-edit a real version number into this file.
+
+IMPORTANT: There is deliberately NO "Recommends: v4l2loopback-dkms" line.
+See "MISTAKE WE MADE AND FIXED" below - this was tried and caused apt to
+auto-attempt a kernel module build during install, which is exactly the
+automatic-driver-install behavior this whole project was told never to do.
+
+
+--- packaging/linux/debian/postinst ---
+#!/bin/sh
+set -e
+chmod +x /usr/lib/mobcam/mobcam || true
+echo ""
+echo "Mob Cam installed."
+echo "A virtual camera driver is required and is not installed by this package."
+echo "Load one with:"
+echo "  sudo modprobe v4l2loopback devices=1 video_nr=10 card_label='Mob Cam' exclusive_caps=1"
+echo "Or use the 'Load driver' button inside the app."
+exit 0
+
+This script runs automatically right after `apt install` unpacks the files.
+It deliberately only PRINTS instructions - it never runs modprobe itself.
+
+
+--- packaging/linux/build_appimage.sh ---
+#!/usr/bin/env bash
+# Packages the PyInstaller onedir build into a Linux AppImage.
+set -e
+
+VERSION="$1"
+ROOT_DIR="$2"
+OUT_DIR="$3"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+APPDIR="$SCRIPT_DIR/build/MobCam.AppDir"
+APPIMAGETOOL="$SCRIPT_DIR/build/appimagetool.AppImage"
+
+rm -rf "$APPDIR"
+mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/applications" "$APPDIR/usr/share/icons/hicolor/256x256/apps"
+
+cp -r "$ROOT_DIR/dist/mobcam/." "$APPDIR/usr/bin/"
+cp "$SCRIPT_DIR/mobcam.desktop" "$APPDIR/usr/share/applications/mobcam.desktop"
+cp "$SCRIPT_DIR/mobcam.desktop" "$APPDIR/mobcam.desktop"
+cp "$ROOT_DIR/logo.png" "$APPDIR/usr/share/icons/hicolor/256x256/apps/mobcam.png"
+cp "$ROOT_DIR/logo.png" "$APPDIR/mobcam.png"
+
+cat > "$APPDIR/AppRun" << 'EOF'
+#!/bin/sh
+HERE="$(dirname "$(readlink -f "${0}")")"
+exec "${HERE}/usr/bin/mobcam" "$@"
+EOF
+chmod +x "$APPDIR/AppRun"
+
+mkdir -p "$SCRIPT_DIR/build"
+if [ ! -f "$APPIMAGETOOL" ]; then
+  echo "==> Downloading appimagetool"
+  curl -L -o "$APPIMAGETOOL" \
+    https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
+  chmod +x "$APPIMAGETOOL"
+fi
+
+mkdir -p "$OUT_DIR"
+ARCH=x86_64 "$APPIMAGETOOL" "$APPDIR" "$OUT_DIR/MobCam-$VERSION-x86_64.AppImage"
+
+echo "==> AppImage built: $OUT_DIR/MobCam-$VERSION-x86_64.AppImage"
+
+
+--- packaging/linux/build_deb.sh ---
+#!/usr/bin/env bash
+# Packages the PyInstaller onedir build into a .deb.
+set -e
+
+VERSION="$1"
+ROOT_DIR="$2"
+OUT_DIR="$3"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PKG_DIR="$SCRIPT_DIR/build/mobcam-deb"
+
+rm -rf "$PKG_DIR"
+mkdir -p "$PKG_DIR/DEBIAN" \
+         "$PKG_DIR/usr/lib/mobcam" \
+         "$PKG_DIR/usr/bin" \
+         "$PKG_DIR/usr/share/applications" \
+         "$PKG_DIR/usr/share/icons/hicolor/256x256/apps"
+
+cp -r "$ROOT_DIR/dist/mobcam/." "$PKG_DIR/usr/lib/mobcam/"
+
+cat > "$PKG_DIR/usr/bin/mobcam" << 'EOF'
+#!/bin/sh
+exec /usr/lib/mobcam/mobcam "$@"
+EOF
+chmod +x "$PKG_DIR/usr/bin/mobcam"
+
+cp "$SCRIPT_DIR/mobcam.desktop" "$PKG_DIR/usr/share/applications/mobcam.desktop"
+cp "$ROOT_DIR/logo.png" "$PKG_DIR/usr/share/icons/hicolor/256x256/apps/mobcam.png"
+
+sed "s/VERSION_PLACEHOLDER/$VERSION/" "$SCRIPT_DIR/debian/control" > "$PKG_DIR/DEBIAN/control"
+cp "$SCRIPT_DIR/debian/postinst" "$PKG_DIR/DEBIAN/postinst"
+chmod +x "$PKG_DIR/DEBIAN/postinst"
+
+mkdir -p "$OUT_DIR"
+DEB_FILE="$OUT_DIR/mobcam_${VERSION}_amd64.deb"
+dpkg-deb --build --root-owner-group "$PKG_DIR" "$DEB_FILE"
+
+echo "==> .deb built: $DEB_FILE"
+
+
+--- build_linux.sh (project root) ---
+#!/usr/bin/env bash
+# Builds Mob Cam for Linux: PyInstaller onedir, then AppImage and .deb.
+# Usage: ./build_linux.sh [version]
+set -e
+
+VERSION="${1:-0.1.0}"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OUT_DIR="$ROOT_DIR/packaging/linux/output"
+
+echo "==> Building Mob Cam v$VERSION for Linux"
+
+pip install --quiet -r requirements-build.txt
+
+rm -rf "$ROOT_DIR/build" "$ROOT_DIR/dist"
+pyinstaller "$ROOT_DIR/mobcam.spec" --noconfirm
+
+mkdir -p "$OUT_DIR"
+bash "$ROOT_DIR/packaging/linux/build_appimage.sh" "$VERSION" "$ROOT_DIR" "$OUT_DIR"
+bash "$ROOT_DIR/packaging/linux/build_deb.sh" "$VERSION" "$ROOT_DIR" "$OUT_DIR"
+
+echo "==> Done. Artifacts in $OUT_DIR"
+ls -la "$OUT_DIR"
+
+
+--- .gitignore additions ---
+venv/
+__pycache__/
+*.pyc
+build/
+dist/
+packaging/linux/build/
+packaging/linux/output/
+.mobcam/
+
+
+CODE CHANGES REQUIRED IN THE APP ITSELF (receiver_gui.py)
+-------------------------------------------------------------
+Packaging is not purely additive - three small changes were needed inside
+receiver_gui.py for the app to work correctly once packaged. All three are
+still fully backward compatible with running `python receiver_gui.py` from
+source.
+
+1. Added import at the top:
+   import sys
+
+2. Added this function (placed after the PORT/AUDIO_STREAM_PORT/BG_KEY_COLOR
+   constants, before RESOLUTIONS):
+
+   def resource_path(filename: str) -> str:
+       """Path to a bundled file, correct both from source and when packaged.
+
+       PyInstaller sets sys._MEIPASS to the folder holding bundled data files
+       (logo.png among them). Running from source, that attribute does not
+       exist, so this falls back to the folder this script lives in.
+       """
+       base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+       return os.path.join(base, filename)
+
+   WHY: logo.png sits next to receiver_gui.py when run from source, but
+   PyInstaller unpacks bundled data files into a different temp/app folder
+   at runtime. Any code loading logo.png by a plain relative path breaks
+   silently (or crashes) once packaged. resource_path() must be used
+   anywhere the app loads logo.png or any other bundled non-Python file.
+
+3. Set the window icon inside ConfigWindow.__init__, right after
+   self.root.protocol("WM_DELETE_WINDOW", self.on_app_close):
+
+       try:
+           self._icon_image = tk.PhotoImage(file=resource_path("logo.png"))
+           self.root.iconphoto(True, self._icon_image)
+       except tk.TclError as exc:
+           print(f"[receiver_gui] could not set window icon: {exc}")
+
+   WHY: self._icon_image must be stored as an instance attribute, not a
+   local variable - Tk does not hold a strong reference to PhotoImage
+   objects on its own, so a local variable gets garbage-collected as soon
+   as __init__ returns, and the icon silently reverts to blank.
+
+4. Changed main() to pass an explicit Tk className:
+
+   def main():
+       # className sets WM_CLASS, which GNOME matches against a .desktop
+       # file's StartupWMClass to pick the correct dock/taskbar icon.
+       # Without this the window is unidentifiable and GNOME falls back to
+       # a generic icon.
+       root = tk.Tk(className="mobcam")
+       ConfigWindow(root)
+       root.mainloop()
+
+   WHY: See the StartupWMClass note under mobcam.desktop above - both sides
+   of this match are required together, changing only one does nothing.
+
+
+BUGS WE HIT AND HOW WE DIAGNOSED THEM
+----------------------------------------
+
+BUG 1: Camera preview blank, QR code for WiFi pairing not showing
+  Symptom (from terminal, only visible when NOT using --console=False, or by
+  temporarily setting console=True in mobcam.spec to see stderr):
+    ModuleNotFoundError: No module named 'PIL._tkinter_finder'
+    (raised inside PIL/ImageTk.py during ImageTk.PhotoImage(...))
+  Cause: PIL.ImageTk resolves this helper module dynamically at import time
+  rather than with a normal top-level import, so PyInstaller's static
+  analysis never detects the dependency and leaves it out of the bundle.
+  Fix: add 'PIL._tkinter_finder' to hidden_imports in mobcam.spec.
+  Lesson: any crash mentioning a missing PIL/Tk/plugin-style submodule after
+  packaging (not before) is almost always a hidden-import problem, not a
+  real logic bug - check mobcam.spec's hidden_imports list first.
+
+BUG 2: App window shows the correct icon internally, but taskbar/dock/app
+switcher/GNOME search all show a generic default icon instead of logo.png
+  Cause: two separate mechanisms control two different icons on Linux.
+  iconphoto() only controls the icon drawn inside the window's own title
+  bar. The taskbar/dock/alt-tab icon comes from the window manager matching
+  the running window's WM_CLASS against an installed .desktop file's
+  StartupWMClass field. Running the script directly with `python
+  receiver_gui.py` in a terminal, there is no .desktop file involved at
+  all, so this will ALWAYS show a generic icon no matter what - that is
+  expected, not a bug, until the app is launched through a real installed
+  .desktop entry.
+  Fix: two matching pieces, both required together -
+    (a) tk.Tk(className="mobcam") in the app's main()
+    (b) StartupWMClass=mobcam in mobcam.desktop
+  Verified working by installing a temporary ~/.local/share/applications/
+  mobcam-dev.desktop pointing at the source venv, launching via GNOME
+  search (not the terminal), and confirming both the search-result icon and
+  the running window's taskbar icon showed logo.png correctly.
+  Lesson to test this: launch through the desktop entry, not the terminal.
+  Terminal launches never show the taskbar-correct icon regardless of any
+  code fix, so testing that way looks like a persistent bug when it is not.
+
+BUG 3: .desktop file silently did not appear in GNOME search at all
+  Cause: the Exec= line contained an unquoted path with a space in it
+  (the project folder is literally named "Mob Cam", with a space). The
+  .desktop file spec requires quoting any Exec path segment containing
+  spaces; GNOME's parser rejected the malformed entry with no visible
+  error rather than showing a broken menu item.
+  Fix: wrap each path segment in double quotes:
+    Exec="/path/with a space/venv/bin/python" "/path/with a space/receiver_gui.py"
+  Diagnosis tool: `desktop-file-validate <file>` - run this on any
+  .desktop file that silently fails to appear anywhere; it will print
+  nothing if the file is actually valid, which itself is useful
+  confirmation.
+
+
+MISTAKE WE MADE AND FIXED: Recommends: v4l2loopback-dkms
+-------------------------------------------------------------
+The control file originally included:
+    Recommends: v4l2loopback-dkms
+
+This was a direct contradiction of a rule set at the start of the whole
+packaging effort: the virtual camera/microphone kernel driver must ALWAYS
+stay a manual, separate, user-initiated step, exactly like DroidCam and
+OBS handle it - never something the installer touches automatically.
+
+apt installs Recommends: packages by default unless the user passes
+--no-install-recommends. So `sudo apt install ./mobcam_x.x.x_amd64.deb`
+silently triggered an automatic v4l2loopback-dkms kernel module rebuild
+during install. On the machine this was tested on, that rebuild failed
+outright because of an unrelated pre-existing stale crash-report file
+blocking a new dkms crash report from being written
+(/var/crash/v4l2loopback-dkms.0.crash already existed), which made the
+whole `apt install` exit with an error even though mobcam itself had
+already installed correctly.
+
+FIX: removed the Recommends: line from control entirely. The postinst
+script's printed modprobe instructions remain the only place the driver is
+ever mentioned - nothing in the package touches it automatically.
+
+LESSON: never add a Recommends: or Depends: line for anything the user is
+supposed to install themselves, even if it feels convenient - apt's default
+behavior of auto-installing Recommends will silently break that intent.
+
+
+STEP-BY-STEP: HOW TO REPRODUCE THIS BUILD FROM SCRATCH
+-----------------------------------------------------------
+1. In the project root, create requirements-build.txt containing:
+     pyinstaller>=6.0
+   Keep this separate from requirements.txt (runtime deps only).
+
+2. Confirm requirements.txt lists every runtime dependency the app actually
+   imports, including ones easy to forget (e.g. sounddevice, needed by
+   audio_output.py but easy to leave out if only skimming imports at the
+   top of the main script).
+
+3. Create mobcam.spec in the project root (full contents above). Point
+   Analysis() at the real entry point script. Use collect_all() in a loop
+   for every dependency that ships extra data files or native binaries
+   (mediapipe, cv2, pyvirtualcam, sounddevice, zeroconf, qrcode). Add
+   'PIL._tkinter_finder' to hidden_imports up front if the app uses
+   PIL.ImageTk anywhere - do not wait to discover this bug the hard way.
+
+4. Make the three code changes listed above in the app's main GUI script
+   (resource_path() helper, iconphoto() call kept as an instance attribute,
+   tk.Tk(className=...)) BEFORE the first build, not after - they were
+   originally discovered as post-build fixes here, but there is no reason
+   to repeat that discovery process next time.
+
+5. Create packaging/linux/mobcam.desktop with StartupWMClass matching
+   whatever className is passed to tk.Tk().
+
+6. Create packaging/linux/debian/control and postinst. Leave the driver
+   (v4l2loopback or equivalent) out of Depends AND Recommends - mention it
+   only in postinst's printed instructions.
+
+7. Create the three build scripts (build_appimage.sh, build_deb.sh,
+   build_linux.sh) as listed above.
+
+8. chmod +x build_linux.sh packaging/linux/build_appimage.sh
+   packaging/linux/build_deb.sh
+
+9. Run: ./build_linux.sh 0.1.0
+   This installs pyinstaller (if needed), runs the PyInstaller build,
+   downloads appimagetool on first run only (cached afterwards in
+   packaging/linux/build/), and produces both artifacts in
+   packaging/linux/output/.
+
+10. TEST before considering it done:
+    - Run dist/mobcam/mobcam directly first (fastest feedback loop, catches
+      most runtime errors before wrapping into AppImage/deb).
+    - Run the .AppImage directly.
+    - Actually install the .deb with `sudo apt install ./mobcam_x.x.x_amd64.deb`
+      (not just check the file exists - the install itself is a real test).
+    - Launch through the OS app search/menu, not the terminal, to verify
+      the desktop entry and icon actually work end to end.
+    - `sudo apt remove mobcam` to confirm clean uninstall.
+
+11. Copy the finished .deb and .AppImage into the Mob Cam Web project's
+    applicationLinux/ folder, and update the two Linux download button
+    hrefs in index.html to the exact filenames (they include the version
+    number, so this step repeats every release).
+
+
+STILL TO DO
+-------------
+- Windows packaging: PyInstaller --onedir + Inno Setup installer wrapping
+  it into a proper .exe installer with Start Menu shortcut and uninstaller.
+  Will need a similar "hidden dependency" pass - expect at least the same
+  PIL._tkinter_finder issue to reappear, likely others specific to Windows
+  (e.g. pyvirtualcam's backend selection, sounddevice/PortAudio bundling).
+- macOS packaging: PyInstaller or py2app producing a .app, wrapped in a
+  .dmg. Requires Apple Developer signing + notarization to avoid Gatekeeper
+  blocking the app outright for anyone who downloads it.
+- Version bumping is currently fully manual (pass a version string as the
+  build_linux.sh argument, and manually rename the download links in
+  index.html each time) - no automated versioning/release pipeline yet.
+- No auto-update mechanism in the app itself yet - users must manually
+  redownload a new version.
