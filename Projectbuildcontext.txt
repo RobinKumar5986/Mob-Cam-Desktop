@@ -7,7 +7,12 @@ what the app does, this file explains how it gets turned into something a
 non-technical user can download and run.
 
 STATUS: Linux packaging is complete and tested (AppImage + .deb).
-Windows and macOS packaging have NOT been started yet.
+macOS packaging is written and ready, but NOT yet built or tested on real
+macOS hardware - it requires an actual Mac to run (PyInstaller does not
+cross-compile; sips/iconutil/hdiutil are macOS-only tools with no Linux
+equivalent). Do not attempt to run build_macos.sh on Linux, it will fail
+immediately on the sips call inside make_icns.sh.
+Windows packaging has NOT been started yet.
 
 GOAL
 ----
@@ -16,7 +21,9 @@ OBS are distributed - no "install Python" step for the end user. Virtual
 camera / microphone drivers (v4l2loopback, OBS virtualcam, VB-CABLE,
 BlackHole) stay a manual, separate step for the user. The packaging never
 installs or touches those drivers automatically - see "MISTAKE WE MADE AND
-FIXED" below for why that rule exists.
+FIXED" below for why that rule exists. This rule applies identically on
+macOS: build_dmg.sh and the .app bundle never install OBS or BlackHole, they
+only get mentioned in the app's own in-app help text.
 
 TOOLCHAIN USED (Linux)
 -----------------------
@@ -32,37 +39,72 @@ dpkg-deb     - wraps the PyInstaller output into a .deb package. User runs
 
 Both formats are produced from the SAME PyInstaller build in one command.
 
+TOOLCHAIN USED (macOS)
+-----------------------
+PyInstaller  - same tool as Linux, but must be RUN ON macOS itself to
+               produce a macOS binary. Its BUNDLE() step wraps the onedir
+               build into a proper "Mob Cam.app" with an Info.plist and a
+               dock icon, instead of a plain folder.
+sips         - built-in macOS image tool, used once to generate the .icns
+               icon set from logo.png. No install needed, no Linux
+               equivalent exists.
+iconutil     - built-in macOS tool, converts the .iconset folder sips built
+               into the single mobcam.icns file PyInstaller's BUNDLE() needs.
+hdiutil      - built-in macOS tool, wraps the finished .app into a
+               distributable .dmg with a drag-to-Applications shortcut.
+
+Unlike Linux, this cannot be done from a script running on Linux at all -
+every one of the four tools above only exists on macOS.
+
 
 PROJECT FILE STRUCTURE (packaging-related files only)
 -------------------------------------------------------
 Mob Cam/                              <- project root
 ├── requirements.txt                  App runtime dependencies (existing file)
 ├── requirements-build.txt            Build-only dependency: pyinstaller
-├── mobcam.spec                       PyInstaller build spec
+├── mobcam.spec                       PyInstaller build spec (Linux)
+├── mobcam_macos.spec                 PyInstaller build spec (macOS, produces
+│                                      a .app via BUNDLE())
 ├── build_linux.sh                    One command that runs the whole Linux
 │                                      build: PyInstaller -> AppImage -> .deb
-├── logo.png                          App icon (existing file, used by spec
-│                                      and by both packaging scripts)
+├── build_macos.sh                    One command that runs the whole macOS
+│                                      build: PyInstaller -> .app -> .dmg.
+│                                      Must be run ON a Mac.
+├── logo.png                          App icon (existing file, used by both
+│                                      specs and all packaging scripts)
 ├── .gitignore                        Excludes venv/, build/, dist/, and
 │                                      packaging output from git
 └── packaging/
-    └── linux/
-        ├── mobcam.desktop            Linux desktop-entry file (app menu /
-        │                             taskbar metadata)
-        ├── build_appimage.sh         Wraps dist/mobcam into an AppImage
-        ├── build_deb.sh              Wraps dist/mobcam into a .deb
-        ├── debian/
-        │   ├── control               .deb metadata: name, version, deps
-        │   └── postinst               Script that runs after `apt install`,
-        │                              prints the v4l2loopback instructions
+    ├── linux/
+    │   ├── mobcam.desktop            Linux desktop-entry file (app menu /
+    │   │                             taskbar metadata)
+    │   ├── build_appimage.sh         Wraps dist/mobcam into an AppImage
+    │   ├── build_deb.sh              Wraps dist/mobcam into a .deb
+    │   ├── debian/
+    │   │   ├── control               .deb metadata: name, version, deps
+    │   │   └── postinst               Script that runs after `apt install`,
+    │   │                              prints the v4l2loopback instructions
+    │   ├── build/                    (gitignored) scratch folder used during
+    │   │                             build - AppDir, .deb staging, cached
+    │   │                             appimagetool download
+    │   └── output/                   (gitignored) final build artifacts land
+    │                                 here: the .AppImage and the .deb
+    └── macos/
+        ├── make_icns.sh              One-time (or per-logo-change) helper:
+        │                             logo.png -> mobcam.iconset -> mobcam.icns
+        ├── build_dmg.sh              Wraps dist/Mob Cam.app into a .dmg
+        ├── mobcam.iconset/           (gitignored) intermediate icon sizes,
+        │                             regenerated by make_icns.sh
+        ├── mobcam.icns                (gitignored) final icon, regenerated
+        │                             by make_icns.sh, consumed by
+        │                             mobcam_macos.spec's BUNDLE() call
         ├── build/                    (gitignored) scratch folder used during
-        │                             build - AppDir, .deb staging, cached
-        │                             appimagetool download
-        └── output/                   (gitignored) final build artifacts land
-                                       here: the .AppImage and the .deb
+        │                             build - .dmg staging area
+        └── output/                   (gitignored) final build artifact lands
+                                       here: the .dmg
 
 
-FULL CONTENTS OF EACH FILE
+FULL CONTENTS OF EACH FILE (LINUX)
 ----------------------------
 
 --- requirements-build.txt ---
@@ -134,6 +176,8 @@ it on its own. Without this line, the app builds and launches fine, but
 crashes the instant it tries to render anything through ImageTk.PhotoImage -
 which in this app means the camera preview window and the WiFi-pairing QR
 code both silently fail. See "BUGS WE HIT" below for the exact symptom.
+This applies equally to the macOS spec below - the fix was added there
+up front rather than waiting to hit the same bug twice.
 
 
 --- packaging/linux/mobcam.desktop ---
@@ -152,7 +196,9 @@ receiver_gui.py's main() function (see "CODE CHANGES REQUIRED IN THE APP
 ITSELF" below). Without both sides matching, GNOME (and most Linux desktop
 environments) cannot associate the running window with this .desktop file,
 and falls back to showing a generic icon in the taskbar/dock/alt-tab, even
-though the window's own title bar icon is fine.
+though the window's own title bar icon is fine. This mechanism is Linux/X11
+window-manager specific and has no macOS equivalent - see the macOS icon
+note further down.
 
 
 --- packaging/linux/debian/control ---
@@ -302,6 +348,185 @@ echo "==> Done. Artifacts in $OUT_DIR"
 ls -la "$OUT_DIR"
 
 
+FULL CONTENTS OF EACH FILE (macOS)
+----------------------------
+
+--- mobcam_macos.spec (project root) ---
+# PyInstaller build spec for the Mob Cam desktop app (macOS .app bundle).
+# Same Analysis as the Linux spec, but adds a BUNDLE() step to produce a
+# proper .app with Info.plist and a dock icon instead of a plain onedir folder.
+from PyInstaller.utils.hooks import collect_all
+
+block_cipher = None
+datas = [('logo.png', '.')]
+binaries = []
+hidden_imports = ['PIL._tkinter_finder']
+
+for pkg in ('mediapipe', 'cv2', 'pyvirtualcam', 'sounddevice', 'zeroconf', 'qrcode'):
+    pkg_datas, pkg_binaries, pkg_hidden = collect_all(pkg)
+    datas += pkg_datas
+    binaries += pkg_binaries
+    hidden_imports += pkg_hidden
+
+a = Analysis(
+    ['receiver_gui.py'],
+    pathex=[],
+    binaries=binaries,
+    datas=datas,
+    hiddenimports=hidden_imports,
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[],
+    noarchive=False,
+    cipher=block_cipher,
+)
+pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+exe = EXE(
+    pyz,
+    a.scripts,
+    [],
+    exclude_binaries=True,
+    name='mobcam',
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=False,
+    console=False,
+)
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=False,
+    upx_exclude=[],
+    name='mobcam',
+)
+app = BUNDLE(
+    coll,
+    name='Mob Cam.app',
+    icon='packaging/macos/mobcam.icns',
+    bundle_identifier='com.kgjr.mobcam',
+    info_plist={
+        'CFBundleName': 'Mob Cam',
+        'CFBundleDisplayName': 'Mob Cam',
+        'CFBundleShortVersionString': '0.1.0',
+        'NSHighResolutionCapable': True,
+        # PortAudio enumerates input devices even though this app only ever
+        # writes to output/loopback devices; some macOS versions still gate
+        # that enumeration behind the mic permission prompt.
+        'NSMicrophoneUsageDescription': 'Mob Cam lists audio output devices to send your phone microphone to.',
+    },
+)
+
+NOTE: kept as a SEPARATE spec file from mobcam.spec rather than branching one
+spec by platform, so the working Linux build can never be broken by a macOS
+change and vice versa.
+
+NOTE: CFBundleShortVersionString is hand-set here because PyInstaller specs
+have no sed-style placeholder mechanism the way debian/control does -
+build_macos.sh patches this value in place with `sed -i ''` before each
+build, same idea as VERSION_PLACEHOLDER on the Linux side, just done
+in-place on the .spec instead of into a fresh generated file.
+
+
+--- packaging/macos/make_icns.sh ---
+#!/usr/bin/env bash
+# Converts logo.png into the .icns PyInstaller's BUNDLE() needs for the dock icon.
+# macOS only - relies on sips and iconutil, both built into the OS.
+set -e
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SRC="$ROOT_DIR/logo.png"
+ICONSET="$ROOT_DIR/packaging/macos/mobcam.iconset"
+ICNS="$ROOT_DIR/packaging/macos/mobcam.icns"
+
+rm -rf "$ICONSET"
+mkdir -p "$ICONSET"
+
+for size in 16 32 64 128 256 512; do
+  sips -z "$size" "$size" "$SRC" --out "$ICONSET/icon_${size}x${size}.png" > /dev/null
+  double=$((size * 2))
+  sips -z "$double" "$double" "$SRC" --out "$ICONSET/icon_${size}x${size}@2x.png" > /dev/null
+done
+
+iconutil -c icns "$ICONSET" -o "$ICNS"
+echo "==> icon built: $ICNS"
+
+NOTE: only needs to run once, or again any time logo.png changes -
+build_macos.sh only calls this automatically if mobcam.icns does not
+already exist yet, so the icon is not needlessly rebuilt every release.
+
+
+--- packaging/macos/build_dmg.sh ---
+#!/usr/bin/env bash
+# Wraps dist/Mob Cam.app into a distributable .dmg.
+set -e
+
+VERSION="$1"
+ROOT_DIR="$2"
+OUT_DIR="$3"
+
+APP_PATH="$ROOT_DIR/dist/Mob Cam.app"
+DMG_STAGING="$ROOT_DIR/packaging/macos/build/dmg-staging"
+DMG_FILE="$OUT_DIR/MobCam-$VERSION.dmg"
+
+rm -rf "$DMG_STAGING"
+mkdir -p "$DMG_STAGING"
+cp -R "$APP_PATH" "$DMG_STAGING/"
+ln -s /Applications "$DMG_STAGING/Applications"
+
+mkdir -p "$OUT_DIR"
+rm -f "$DMG_FILE"
+
+hdiutil create -volname "Mob Cam" \
+  -srcfolder "$DMG_STAGING" \
+  -ov -format UDZO \
+  "$DMG_FILE"
+
+echo "==> .dmg built: $DMG_FILE"
+
+NOTE: the Applications symlink inside the .dmg is what gives users the
+familiar "drag Mob Cam into Applications" install gesture standard on macOS
+- without it the .dmg still works, but looks unfinished/unofficial.
+
+
+--- build_macos.sh (project root) ---
+#!/usr/bin/env bash
+# Builds Mob Cam for macOS: PyInstaller .app bundle, then wraps it into a .dmg.
+# Must run on an actual Mac - PyInstaller does not cross-compile.
+# Usage: ./build_macos.sh [version]
+set -e
+
+VERSION="${1:-0.1.0}"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OUT_DIR="$ROOT_DIR/packaging/macos/output"
+
+echo "==> Building Mob Cam v$VERSION for macOS"
+
+pip install --quiet -r requirements-build.txt
+
+if [ ! -f "$ROOT_DIR/packaging/macos/mobcam.icns" ]; then
+  echo "==> No icon found, generating one from logo.png"
+  bash "$ROOT_DIR/packaging/macos/make_icns.sh"
+fi
+
+# Stamp the version into the spec's Info.plist before building.
+sed -i '' "s/'CFBundleShortVersionString': '[^']*'/'CFBundleShortVersionString': '$VERSION'/" \
+  "$ROOT_DIR/mobcam_macos.spec"
+
+rm -rf "$ROOT_DIR/build" "$ROOT_DIR/dist"
+pyinstaller "$ROOT_DIR/mobcam_macos.spec" --noconfirm
+
+mkdir -p "$OUT_DIR"
+bash "$ROOT_DIR/packaging/macos/build_dmg.sh" "$VERSION" "$ROOT_DIR" "$OUT_DIR"
+
+echo "==> Done. Artifact in $OUT_DIR"
+ls -la "$OUT_DIR"
+
+
 --- .gitignore additions ---
 venv/
 __pycache__/
@@ -310,6 +535,10 @@ build/
 dist/
 packaging/linux/build/
 packaging/linux/output/
+packaging/macos/build/
+packaging/macos/output/
+packaging/macos/mobcam.iconset/
+packaging/macos/mobcam.icns
 .mobcam/
 
 
@@ -318,7 +547,7 @@ CODE CHANGES REQUIRED IN THE APP ITSELF (receiver_gui.py)
 Packaging is not purely additive - three small changes were needed inside
 receiver_gui.py for the app to work correctly once packaged. All three are
 still fully backward compatible with running `python receiver_gui.py` from
-source.
+source, and all three work unchanged on both Linux and macOS.
 
 1. Added import at the top:
    import sys
@@ -341,6 +570,7 @@ source.
    at runtime. Any code loading logo.png by a plain relative path breaks
    silently (or crashes) once packaged. resource_path() must be used
    anywhere the app loads logo.png or any other bundled non-Python file.
+   This behaves identically on macOS - no platform branching needed.
 
 3. Set the window icon inside ConfigWindow.__init__, right after
    self.root.protocol("WM_DELETE_WINDOW", self.on_app_close):
@@ -355,6 +585,9 @@ source.
    local variable - Tk does not hold a strong reference to PhotoImage
    objects on its own, so a local variable gets garbage-collected as soon
    as __init__ returns, and the icon silently reverts to blank.
+   On macOS this call is harmless but does NOT control the dock icon -
+   see the macOS icon note below, mobcam_macos.spec's BUNDLE(icon=...)
+   is what actually sets that.
 
 4. Changed main() to pass an explicit Tk className:
 
@@ -369,9 +602,32 @@ source.
 
    WHY: See the StartupWMClass note under mobcam.desktop above - both sides
    of this match are required together, changing only one does nothing.
+   This is a no-op on macOS (WM_CLASS/StartupWMClass is an X11/Linux
+   window-manager concept) - no macOS-specific equivalent is needed here,
+   the dock icon is handled entirely by the .icns bundled into the .app.
 
 
-BUGS WE HIT AND HOW WE DIAGNOSED THEM
+HOW THE macOS DOCK ICON WORKS (compare to Linux BUG 2 above)
+-------------------------------------------------------------
+On Linux, the taskbar/dock icon and the window's own title-bar icon are
+controlled by two separate mechanisms (iconphoto() vs WM_CLASS matching a
+.desktop file), which is why BUG 2 happened there.
+
+On macOS there is only one mechanism: the icon embedded in the .app bundle
+via CFBundleIconFile, which mobcam_macos.spec sets through BUNDLE(icon=
+'packaging/macos/mobcam.icns'). That single icon covers the Dock, Finder,
+Launchpad, and Cmd+Tab switcher all at once. iconphoto() inside
+receiver_gui.py still runs (harmless, low cost, keeps the code identical
+across platforms) but has no visible effect on macOS - it only ever
+touched the in-window title bar icon there, and Tk windows on macOS do not
+draw a title-bar icon at all.
+
+Practical implication: if the .app's Dock icon looks wrong or missing after
+a macOS build, the fix is in mobcam.icns / make_icns.sh / the BUNDLE() icon
+path in mobcam_macos.spec - never in receiver_gui.py.
+
+
+BUGS WE HIT AND HOW WE DIAGNOSED THEM (Linux)
 ----------------------------------------
 
 BUG 1: Camera preview blank, QR code for WiFi pairing not showing
@@ -385,7 +641,9 @@ BUG 1: Camera preview blank, QR code for WiFi pairing not showing
   Fix: add 'PIL._tkinter_finder' to hidden_imports in mobcam.spec.
   Lesson: any crash mentioning a missing PIL/Tk/plugin-style submodule after
   packaging (not before) is almost always a hidden-import problem, not a
-  real logic bug - check mobcam.spec's hidden_imports list first.
+  real logic bug - check mobcam.spec's hidden_imports list first. This
+  exact line was added to mobcam_macos.spec up front for this reason - if
+  it ever gets removed by accident, expect this same crash on macOS too.
 
 BUG 2: App window shows the correct icon internally, but taskbar/dock/app
 switcher/GNOME search all show a generic default icon instead of logo.png
@@ -408,6 +666,8 @@ switcher/GNOME search all show a generic default icon instead of logo.png
   Lesson to test this: launch through the desktop entry, not the terminal.
   Terminal launches never show the taskbar-correct icon regardless of any
   code fix, so testing that way looks like a persistent bug when it is not.
+  This bug class does not exist on macOS - see "HOW THE macOS DOCK ICON
+  WORKS" above.
 
 BUG 3: .desktop file silently did not appear in GNOME search at all
   Cause: the Exec= line contained an unquoted path with a space in it
@@ -421,6 +681,30 @@ BUG 3: .desktop file silently did not appear in GNOME search at all
   .desktop file that silently fails to appear anywhere; it will print
   nothing if the file is actually valid, which itself is useful
   confirmation.
+  Worth remembering for macOS too: build_dmg.sh's APP_PATH variable
+  ("$ROOT_DIR/dist/Mob Cam.app") is deliberately quoted end-to-end for the
+  exact same reason - the project folder and the .app name both contain
+  spaces ("Mob Cam" / "Mob Cam.app"), so any unquoted path segment added
+  later to these scripts will break the same way BUG 3 did.
+
+BUG (ATTEMPTED, CAUGHT BEFORE A REAL BUILD): running build_macos.sh on Linux
+  Symptom:
+    ./build_macos.sh 0.1.0
+    ==> Building Mob Cam v0.1.0 for macOS
+    ==> No icon found, generating one from logo.png
+    packaging/macos/make_icns.sh: line 15: sips: command not found
+  Cause: build_macos.sh (and everything downstream of it: make_icns.sh's
+  sips/iconutil calls, build_dmg.sh's hdiutil call, and PyInstaller's own
+  ability to produce a macOS binary) only work when the shell running them
+  is macOS itself. Nothing here is installable via apt or any other Linux
+  package manager - sips/iconutil/hdiutil ship as part of the OS, not as
+  separate tools.
+  Fix: there is no fix that keeps this on Linux. The build must run on
+  real macOS hardware, a rented cloud Mac, or a macOS CI runner (e.g.
+  GitHub Actions macos-latest).
+  Lesson: check `uname` / the shell prompt before debugging a macOS build
+  failure line-by-line - if the machine is not actually macOS, every tool
+  in the chain will fail the same way, and no script change fixes it.
 
 
 MISTAKE WE MADE AND FIXED: Recommends: v4l2loopback-dkms
@@ -450,9 +734,13 @@ ever mentioned - nothing in the package touches it automatically.
 LESSON: never add a Recommends: or Depends: line for anything the user is
 supposed to install themselves, even if it feels convenient - apt's default
 behavior of auto-installing Recommends will silently break that intent.
+Same rule applies to the macOS side: build_dmg.sh and mobcam_macos.spec
+must never bundle, install, or auto-launch OBS or BlackHole - the .app
+should only ever surface setup instructions on screen, exactly like the
+Linux "Load driver" / "Fix / help" buttons already do.
 
 
-STEP-BY-STEP: HOW TO REPRODUCE THIS BUILD FROM SCRATCH
+STEP-BY-STEP: HOW TO REPRODUCE THE LINUX BUILD FROM SCRATCH
 -----------------------------------------------------------
 1. In the project root, create requirements-build.txt containing:
      pyinstaller>=6.0
@@ -470,7 +758,7 @@ STEP-BY-STEP: HOW TO REPRODUCE THIS BUILD FROM SCRATCH
    'PIL._tkinter_finder' to hidden_imports up front if the app uses
    PIL.ImageTk anywhere - do not wait to discover this bug the hard way.
 
-4. Make the three code changes listed above in the app's main GUI script
+4. Make the four code changes listed above in the app's main GUI script
    (resource_path() helper, iconphoto() call kept as an instance attribute,
    tk.Tk(className=...)) BEFORE the first build, not after - they were
    originally discovered as post-build fixes here, but there is no reason
@@ -511,18 +799,98 @@ STEP-BY-STEP: HOW TO REPRODUCE THIS BUILD FROM SCRATCH
     number, so this step repeats every release).
 
 
+STEP-BY-STEP: HOW TO BUILD THE macOS .dmg (REQUIRES AN ACTUAL MAC)
+-----------------------------------------------------------
+This entire section only works when run ON macOS - a physical Mac, a rented
+cloud Mac (MacStadium, MacinCloud, AWS EC2 Mac instances), or a macOS CI
+runner (e.g. GitHub Actions macos-latest). PyInstaller does not
+cross-compile, and sips/iconutil/hdiutil below are macOS-only system tools
+with no Linux package or workaround. Do not attempt any of this from Linux.
+
+1. On the Mac, confirm Python 3 and pip are available, then from the
+   project root:
+     python3 -m venv venv
+     source venv/bin/activate
+     pip install -r requirements.txt
+     pip install -r requirements-build.txt
+
+2. Confirm mobcam_macos.spec exists in the project root (full contents
+   above). It is intentionally a separate file from mobcam.spec so the
+   working Linux build can never be broken by a macOS change.
+
+3. Confirm packaging/macos/make_icns.sh and packaging/macos/build_dmg.sh
+   exist (full contents above).
+
+4. Make scripts executable:
+     chmod +x build_macos.sh packaging/macos/build_dmg.sh packaging/macos/make_icns.sh
+
+5. Run the build:
+     ./build_macos.sh 0.1.0
+   This will:
+     - pip install pyinstaller if missing
+     - generate packaging/macos/mobcam.icns from logo.png, if it does not
+       already exist (skips regeneration on later builds unless the icon
+       or logo.png changed - delete mobcam.icns manually to force a
+       regeneration)
+     - stamp the version string into mobcam_macos.spec's Info.plist
+     - run PyInstaller against mobcam_macos.spec, producing
+       "dist/Mob Cam.app"
+     - run build_dmg.sh, producing
+       packaging/macos/output/MobCam-0.1.0.dmg
+
+6. TEST before considering it done:
+    - Run "dist/Mob Cam.app" directly first (fastest feedback loop) -
+      either double-click in Finder, or:
+        open "dist/Mob Cam.app"
+    - If it fails to launch or crashes, check Console.app for the crash
+      log, or run the binary inside the bundle directly to see stderr:
+        "dist/Mob Cam.app/Contents/MacOS/mobcam"
+      Same lesson as Linux BUG 1: any crash mentioning a missing PIL/Tk
+      submodule means hidden_imports needs an entry in mobcam_macos.spec.
+    - Mount the .dmg and drag "Mob Cam.app" to Applications the way a real
+      user would, then launch it from there (not from the mounted .dmg
+      itself, which is a read-only volume).
+    - If unsigned (see GATEKEEPER note below), you likely need to clear
+      the quarantine flag once for local testing only:
+        xattr -cr "dist/Mob Cam.app"
+      This is NOT a substitute for real signing/notarization before
+      giving the .dmg to anyone else.
+    - Confirm the app's own camera/mic setup screens correctly point users
+      to installing OBS (for the virtualcam backend) and BlackHole 2ch,
+      exactly as documented in projectContextForAi.txt's SETUP section -
+      packaging must never install either automatically.
+
+7. Copy the finished .dmg into the Mob Cam Web project's applicationMac/
+   folder (create it if it does not exist yet, mirroring applicationLinux/),
+   and add/update the macOS download button href in index.html to the
+   exact filename (it includes the version number, so this step repeats
+   every release, same as the Linux artifacts).
+
+GATEKEEPER NOTE: without an Apple Developer ID ($99/yr) used to sign and
+notarize the .dmg, macOS will block it for anyone who downloads it from
+outside the App Store - this is expected and not a packaging bug. Signing
+and notarization are a separate, not-yet-done step; the build above
+produces a correct, testable, but not yet distributable .dmg.
+
+
 STILL TO DO
 -------------
+- macOS packaging: build_macos.sh / mobcam_macos.spec / build_dmg.sh are
+  written and believed correct, but have not yet actually been run and
+  tested on real macOS hardware - do that pass before treating macOS as
+  "done" the way Linux is. Requires Apple Developer signing + notarization
+  before public distribution, to avoid Gatekeeper blocking the app outright
+  for anyone who downloads it.
+- Consider a GitHub Actions macos-latest workflow to run build_macos.sh in
+  CI, so macOS builds do not require owning a Mac - not yet written.
 - Windows packaging: PyInstaller --onedir + Inno Setup installer wrapping
   it into a proper .exe installer with Start Menu shortcut and uninstaller.
   Will need a similar "hidden dependency" pass - expect at least the same
   PIL._tkinter_finder issue to reappear, likely others specific to Windows
   (e.g. pyvirtualcam's backend selection, sounddevice/PortAudio bundling).
-- macOS packaging: PyInstaller or py2app producing a .app, wrapped in a
-  .dmg. Requires Apple Developer signing + notarization to avoid Gatekeeper
-  blocking the app outright for anyone who downloads it.
 - Version bumping is currently fully manual (pass a version string as the
-  build_linux.sh argument, and manually rename the download links in
-  index.html each time) - no automated versioning/release pipeline yet.
+  build_linux.sh / build_macos.sh argument, and manually rename the
+  download links in index.html each time) - no automated versioning/
+  release pipeline yet.
 - No auto-update mechanism in the app itself yet - users must manually
   redownload a new version.

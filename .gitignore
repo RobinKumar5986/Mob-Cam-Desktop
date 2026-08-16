@@ -17,3 +17,9 @@ packaging/linux/output/
 
 # Local user settings written at runtime, not part of the source
 .mobcam/
+
+# MacOs Build iggnore files 
+packaging/macos/build/
+packaging/macos/output/
+packaging/macos/mobcam.iconset/
+packaging/macos/mobcam.icns
