@@ -12,7 +12,15 @@ macOS hardware - it requires an actual Mac to run (PyInstaller does not
 cross-compile; sips/iconutil/hdiutil are macOS-only tools with no Linux
 equivalent). Do not attempt to run build_macos.sh on Linux, it will fail
 immediately on the sips call inside make_icns.sh.
-Windows packaging has NOT been started yet.
+Windows packaging is written and ready (mobcam_windows.spec, build_windows.ps1,
+packaging/windows/mobcam.iss), but NOT yet built or tested on real Windows
+hardware - it requires an actual Windows machine to run (PyInstaller does not
+cross-compile; ISCC.exe/Inno Setup is a Windows tool). The one piece that CAN
+be done ahead of time from Linux is the icon: packaging/windows/make_ico.py
+uses Pillow, which has no OS restriction, so mobcam.ico can be generated on
+Linux and just carried over with the rest of the project folder. Do not
+attempt to run build_windows.ps1 on Linux, it will fail immediately (it is
+PowerShell, and even under pwsh the pyinstaller/ISCC steps still need Windows).
 
 GOAL
 ----
@@ -23,7 +31,10 @@ BlackHole) stay a manual, separate step for the user. The packaging never
 installs or touches those drivers automatically - see "MISTAKE WE MADE AND
 FIXED" below for why that rule exists. This rule applies identically on
 macOS: build_dmg.sh and the .app bundle never install OBS or BlackHole, they
-only get mentioned in the app's own in-app help text.
+only get mentioned in the app's own in-app help text. Same rule again on
+Windows: mobcam.iss's post-install message only prints instructions for OBS
+Studio (camera) and VB-CABLE (mic) - it never bundles or silently installs
+either.
 
 TOOLCHAIN USED (Linux)
 -----------------------
@@ -56,6 +67,30 @@ hdiutil      - built-in macOS tool, wraps the finished .app into a
 Unlike Linux, this cannot be done from a script running on Linux at all -
 every one of the four tools above only exists on macOS.
 
+TOOLCHAIN USED (Windows)
+-----------------------
+PyInstaller  - same tool as Linux/macOS, but must be RUN ON Windows itself
+               to produce a .exe. No BUNDLE() step is needed the way macOS
+               needs one - EXE(icon=...) embeds the icon directly into the
+               .exe, so the onedir output is already a normal-looking
+               Windows app folder.
+Pillow       - already a runtime dependency (used for the icon conversion
+               script only, not part of packaging logic). Converts logo.png
+               straight to .ico. Unlike sips/iconutil on macOS, this is NOT
+               Windows-only - it can be run from Linux ahead of time.
+Inno Setup   - third-party, NOT bundled with Windows or pip-installable.
+               Downloaded once from https://jrsoftware.org/isdl.php.
+               Its compiler, ISCC.exe, wraps the PyInstaller onedir build
+               into a single installer .exe with a Start Menu entry, an
+               optional desktop shortcut, and a real uninstaller entry in
+               "Add or Remove Programs" - the Windows equivalent of what
+               dpkg-deb gives Linux and what the .dmg's drag-to-Applications
+               gesture gives macOS.
+
+Unlike Linux, and same as macOS, the PyInstaller step cannot be done from a
+script running on Linux - it must run on Windows (physical machine, VM, or a
+Windows CI runner such as GitHub Actions windows-latest).
+
 
 PROJECT FILE STRUCTURE (packaging-related files only)
 -------------------------------------------------------
@@ -65,11 +100,18 @@ Mob Cam/                              <- project root
 ├── mobcam.spec                       PyInstaller build spec (Linux)
 ├── mobcam_macos.spec                 PyInstaller build spec (macOS, produces
 │                                      a .app via BUNDLE())
+├── mobcam_windows.spec               PyInstaller build spec (Windows,
+│                                      produces mobcam.exe with an icon set
+│                                      via EXE(icon=...))
 ├── build_linux.sh                    One command that runs the whole Linux
 │                                      build: PyInstaller -> AppImage -> .deb
 ├── build_macos.sh                    One command that runs the whole macOS
 │                                      build: PyInstaller -> .app -> .dmg.
 │                                      Must be run ON a Mac.
+├── build_windows.ps1                 One command that runs the whole
+│                                      Windows build: PyInstaller -> Inno
+│                                      Setup installer. Must be run ON
+│                                      Windows.
 ├── logo.png                          App icon (existing file, used by both
 │                                      specs and all packaging scripts)
 ├── .gitignore                        Excludes venv/, build/, dist/, and
@@ -89,19 +131,35 @@ Mob Cam/                              <- project root
     │   │                             appimagetool download
     │   └── output/                   (gitignored) final build artifacts land
     │                                 here: the .AppImage and the .deb
-    └── macos/
-        ├── make_icns.sh              One-time (or per-logo-change) helper:
-        │                             logo.png -> mobcam.iconset -> mobcam.icns
-        ├── build_dmg.sh              Wraps dist/Mob Cam.app into a .dmg
-        ├── mobcam.iconset/           (gitignored) intermediate icon sizes,
-        │                             regenerated by make_icns.sh
-        ├── mobcam.icns                (gitignored) final icon, regenerated
-        │                             by make_icns.sh, consumed by
-        │                             mobcam_macos.spec's BUNDLE() call
-        ├── build/                    (gitignored) scratch folder used during
-        │                             build - .dmg staging area
+    ├── macos/
+    │   ├── make_icns.sh              One-time (or per-logo-change) helper:
+    │   │                             logo.png -> mobcam.iconset -> mobcam.icns
+    │   ├── build_dmg.sh              Wraps dist/Mob Cam.app into a .dmg
+    │   ├── mobcam.iconset/           (gitignored) intermediate icon sizes,
+    │   │                             regenerated by make_icns.sh
+    │   ├── mobcam.icns                (gitignored) final icon, regenerated
+    │   │                             by make_icns.sh, consumed by
+    │   │                             mobcam_macos.spec's BUNDLE() call
+    │   ├── build/                    (gitignored) scratch folder used during
+    │   │                             build - .dmg staging area
+    │   └── output/                   (gitignored) final build artifact lands
+    │                                 here: the .dmg
+    └── windows/
+        ├── make_ico.py                One-time (or per-logo-change) helper:
+        │                              logo.png -> mobcam.ico. Pure Pillow,
+        │                              runs on any OS including Linux.
+        ├── mobcam.iss                 Inno Setup script. Wraps
+        │                              dist/mobcam into MobCam-Setup-X.X.X.exe
+        ├── mobcam.ico                 (gitignored) final icon, regenerated
+        │                              by make_ico.py, consumed by both
+        │                              mobcam_windows.spec's EXE(icon=...)
+        │                              and mobcam.iss's SetupIconFile
+        ├── build/                    (gitignored) scratch folder - currently
+        │                             unused directly by Inno Setup, kept for
+        │                             parity with the other two platforms in
+        │                             case a staging step is added later
         └── output/                   (gitignored) final build artifact lands
-                                       here: the .dmg
+                                       here: MobCam-Setup-X.X.X.exe
 
 
 FULL CONTENTS OF EACH FILE (LINUX)
@@ -176,8 +234,9 @@ it on its own. Without this line, the app builds and launches fine, but
 crashes the instant it tries to render anything through ImageTk.PhotoImage -
 which in this app means the camera preview window and the WiFi-pairing QR
 code both silently fail. See "BUGS WE HIT" below for the exact symptom.
-This applies equally to the macOS spec below - the fix was added there
-up front rather than waiting to hit the same bug twice.
+This applies equally to the macOS and Windows specs - the fix was added to
+both of those up front for this reason rather than waiting to hit the same
+bug twice more.
 
 
 --- packaging/linux/mobcam.desktop ---
@@ -197,8 +256,8 @@ ITSELF" below). Without both sides matching, GNOME (and most Linux desktop
 environments) cannot associate the running window with this .desktop file,
 and falls back to showing a generic icon in the taskbar/dock/alt-tab, even
 though the window's own title bar icon is fine. This mechanism is Linux/X11
-window-manager specific and has no macOS equivalent - see the macOS icon
-note further down.
+window-manager specific and has no macOS or Windows equivalent - see the
+platform-specific icon notes further down.
 
 
 --- packaging/linux/debian/control ---
@@ -423,7 +482,7 @@ app = BUNDLE(
 
 NOTE: kept as a SEPARATE spec file from mobcam.spec rather than branching one
 spec by platform, so the working Linux build can never be broken by a macOS
-change and vice versa.
+change and vice versa. Same reasoning applied again for mobcam_windows.spec.
 
 NOTE: CFBundleShortVersionString is hand-set here because PyInstaller specs
 have no sed-style placeholder mechanism the way debian/control does -
@@ -490,7 +549,9 @@ echo "==> .dmg built: $DMG_FILE"
 
 NOTE: the Applications symlink inside the .dmg is what gives users the
 familiar "drag Mob Cam into Applications" install gesture standard on macOS
-- without it the .dmg still works, but looks unfinished/unofficial.
+- without it the .dmg still works, but looks unfinished/unofficial. The
+Windows equivalent of this gesture is Inno Setup's own installer wizard -
+see mobcam.iss below, no staging folder trick is needed there.
 
 
 --- build_macos.sh (project root) ---
@@ -527,104 +588,267 @@ echo "==> Done. Artifact in $OUT_DIR"
 ls -la "$OUT_DIR"
 
 
---- .gitignore additions ---
-venv/
-__pycache__/
-*.pyc
-build/
-dist/
-packaging/linux/build/
-packaging/linux/output/
-packaging/macos/build/
-packaging/macos/output/
-packaging/macos/mobcam.iconset/
-packaging/macos/mobcam.icns
-.mobcam/
+FULL CONTENTS OF EACH FILE (Windows)
+----------------------------
+
+--- mobcam_windows.spec (project root) ---
+# PyInstaller build spec for the Mob Cam desktop app (Windows onedir build).
+# Same Analysis as the Linux spec, plus an icon embedded straight into the exe -
+# there is no separate BUNDLE() step like macOS, PyInstaller's EXE() does it directly.
+
+from PyInstaller.utils.hooks import collect_all
+
+block_cipher = None
+
+datas = [('logo.png', '.')]
+binaries = []
+hidden_imports = ['PIL._tkinter_finder']
+
+for pkg in ('mediapipe', 'cv2', 'pyvirtualcam', 'sounddevice', 'zeroconf', 'qrcode'):
+    pkg_datas, pkg_binaries, pkg_hidden = collect_all(pkg)
+    datas += pkg_datas
+    binaries += pkg_binaries
+    hidden_imports += pkg_hidden
+
+a = Analysis(
+    ['receiver_gui.py'],
+    pathex=[],
+    binaries=binaries,
+    datas=datas,
+    hiddenimports=hidden_imports,
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[],
+    noarchive=False,
+    cipher=block_cipher,
+)
+
+pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    [],
+    exclude_binaries=True,
+    name='mobcam',
+    icon='packaging/windows/mobcam.ico',
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=False,
+    console=False,
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=False,
+    upx_exclude=[],
+    name='mobcam',
+)
+
+NOTE: kept as a SEPARATE spec file from mobcam.spec and mobcam_macos.spec,
+same reasoning as the macOS spec - a Windows-only change here can never
+break the working Linux or macOS builds.
+
+NOTE: icon= on EXE() is what sets the .exe's file icon and the taskbar icon
+on Windows - equivalent role to BUNDLE(icon=...) on macOS. iconphoto() inside
+receiver_gui.py still runs (harmless) but has no visible effect here, same as
+on macOS. tk.Tk(className="mobcam") is also a no-op on Windows - WM_CLASS is
+an X11/Linux concept, nothing to match here. See "HOW THE WINDOWS ICON WORKS"
+below.
+
+NOTE: 'PIL._tkinter_finder' is carried into hidden_imports up front for the
+same reason as the other two specs - see BUG 1 under "BUGS WE HIT" below.
 
 
-CODE CHANGES REQUIRED IN THE APP ITSELF (receiver_gui.py)
+--- packaging/windows/make_ico.py ---
+"""Converts logo.png into the .ico PyInstaller and Inno Setup need on Windows.
+
+Unlike macOS's make_icns.sh, this needs no OS-specific tool - Pillow can write
+.ico on any platform, so this can be run from Linux ahead of time.
+"""
+import os
+from PIL import Image
+
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+SRC = os.path.join(ROOT, "logo.png")
+DST = os.path.join(ROOT, "packaging", "windows", "mobcam.ico")
+
+SIZES = [16, 32, 48, 64, 128, 256]
+
+
+def main():
+    img = Image.open(SRC).convert("RGBA")
+    img.save(DST, sizes=[(s, s) for s in SIZES])
+    print(f"==> icon built: {DST}")
+
+
+if __name__ == "__main__":
+    main()
+
+NOTE: this is the one packaging step for Windows that does NOT require
+Windows hardware - it has already been run once on the Linux dev machine
+(Megatron) and produced packaging/windows/mobcam.ico successfully. Re-run it
+any time logo.png changes; build_windows.ps1 only calls it automatically if
+mobcam.ico is missing, same pattern as make_icns.sh on macOS.
+
+
+--- packaging/windows/mobcam.iss ---
+; Inno Setup script for Mob Cam.
+; Build with: ISCC /DMyAppVersion=0.1.0 mobcam.iss
+; MyAppId is a fixed GUID so upgrades replace the old install instead of side-by-side installing.
+#ifndef MyAppVersion
+  #define MyAppVersion "0.1.0"
+#endif
+#define MyAppName "Mob Cam"
+#define MyAppPublisher "Robin Kumar"
+#define MyAppExeName "mobcam.exe"
+#define MyAppId "{B6E1B6C1-9E1E-4F1B-8B2B-3B9C1A2F5D77}"
+
+[Setup]
+AppId={{#MyAppId}
+AppName={#MyAppName}
+AppVersion={#MyAppVersion}
+AppPublisher={#MyAppPublisher}
+DefaultDirName={autopf}\{#MyAppName}
+DefaultGroupName={#MyAppName}
+UninstallDisplayIcon={app}\{#MyAppExeName}
+OutputBaseFilename=MobCam-Setup-{#MyAppVersion}
+OutputDir=output
+Compression=lzma2
+SolidCompression=yes
+SetupIconFile=mobcam.ico
+ArchitecturesInstallIn64BitMode=x64
+DisableProgramGroupPage=yes
+
+[Languages]
+Name: "english"; MessagesFile: "compiler:Default.isl"
+
+[Tasks]
+Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
+
+[Files]
+Source: "..\..\dist\mobcam\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+[Icons]
+Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
+Name: "{group}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+
+[Run]
+Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent unchecked
+
+[Code]
+// Same rule as the Linux postinst and the macOS in-app help text: never
+// install the camera/mic driver automatically, only tell the user how.
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+  begin
+    MsgBox('Mob Cam installed.' + #13#10 +
+      'A virtual camera and microphone driver are required and are not installed by this setup.' + #13#10#13#10 +
+      'Camera: install OBS Studio and launch it once (this adds the OBS Virtual Camera).' + #13#10 +
+      'Microphone: install VB-CABLE, then set Mob Cam''s output to "CABLE Input" - apps record from "CABLE Output".',
+      mbInformation, MB_OK);
+  end;
+end;
+
+NOTE: OutputDir=output is relative to mobcam.iss's own folder
+(packaging/windows/), so the finished installer lands in
+packaging/windows/output/ - matches the Linux/macOS output/ folder
+convention even though build_windows.ps1 invokes ISCC from the project
+root.
+
+NOTE: [Code]'s CurStepChanged is the Windows equivalent of the Linux
+postinst script and the macOS app's in-app setup screens - all three exist
+solely to print instructions, never to run the install themselves. See
+"MISTAKE WE MADE AND FIXED" below for why this rule is non-negotiable.
+
+
+--- build_windows.ps1 (project root) ---
+# Builds Mob Cam for Windows: PyInstaller onedir, then wraps it into an installer .exe via Inno Setup.
+# Must run on Windows - PyInstaller does not cross-compile.
+# Requires Inno Setup 6 (https://jrsoftware.org/isdl.php) with ISCC.exe on PATH or at its default install path.
+# Usage: .\build_windows.ps1 [version]
+
+param(
+    [string]$Version = "0.1.0"
+)
+$ErrorActionPreference = "Stop"
+
+$RootDir = $PSScriptRoot
+$OutDir = Join-Path $RootDir "packaging\windows\output"
+
+Write-Host "==> Building Mob Cam v$Version for Windows"
+
+pip install --quiet -r requirements-build.txt
+
+$IcoPath = Join-Path $RootDir "packaging\windows\mobcam.ico"
+if (-not (Test-Path $IcoPath)) {
+    Write-Host "==> No icon found, generating one from logo.png"
+    python "$RootDir\packaging\windows\make_ico.py"
+}
+
+Remove-Item -Recurse -Force "$RootDir\build", "$RootDir\dist" -ErrorAction SilentlyContinue
+pyinstaller "$RootDir\mobcam_windows.spec" --noconfirm
+
+$Iscc = (Get-Command "ISCC.exe" -ErrorAction SilentlyContinue).Source
+if (-not $Iscc) {
+    $DefaultPath = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+    if (Test-Path $DefaultPath) {
+        $Iscc = $DefaultPath
+    } else {
+        throw "ISCC.exe not found. Install Inno Setup 6 from https://jrsoftware.org/isdl.php"
+    }
+}
+
+New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+& $Iscc "/DMyAppVersion=$Version" "$RootDir\packaging\windows\mobcam.iss"
+
+Write-Host "==> Done. Artifact in $OutDir"
+Get-ChildItem $OutDir
+
+NOTE: unlike build_linux.sh/build_macos.sh, this is PowerShell, not a POSIX
+shell script - Windows ships PowerShell by default, so this needs no extra
+install the way bash on Windows would.
+
+NOTE: the version string is passed to ISCC via /DMyAppVersion=..., which
+feeds mobcam.iss's #ifndef MyAppVersion block - same idea as the
+VERSION_PLACEHOLDER sed substitution on the Linux side and the CFBundleShortVersionString
+sed substitution on the macOS side, just done through Inno Setup's own
+preprocessor instead of a text substitution into a file.
+
+
+--- .gitignore additions (Windows) ---
+packaging/windows/build/
+packaging/windows/output/
+packaging/windows/mobcam.ico
+
+
+HOW THE WINDOWS ICON WORKS (compare to Linux BUG 2 and macOS notes above)
 -------------------------------------------------------------
-Packaging is not purely additive - three small changes were needed inside
-receiver_gui.py for the app to work correctly once packaged. All three are
-still fully backward compatible with running `python receiver_gui.py` from
-source, and all three work unchanged on both Linux and macOS.
+Like macOS and unlike Linux, Windows has only one real mechanism for the
+app's icon: it is embedded directly into the .exe at build time. Here that
+happens via EXE(icon='packaging/windows/mobcam.ico', ...) inside
+mobcam_windows.spec - no separate BUNDLE()-style step is needed the way
+macOS needs one, PyInstaller's EXE() writes the icon resource straight into
+the binary. That single icon covers File Explorer, the taskbar, Alt+Tab,
+and the Start Menu shortcut Inno Setup creates, all at once.
 
-1. Added import at the top:
-   import sys
+iconphoto() inside receiver_gui.py still runs on Windows (harmless, keeps
+the code identical across all three platforms) but has no visible effect -
+same as on macOS, it only ever controlled the in-window title bar icon on
+Linux, and that codepath is essentially a no-op everywhere else.
 
-2. Added this function (placed after the PORT/AUDIO_STREAM_PORT/BG_KEY_COLOR
-   constants, before RESOLUTIONS):
-
-   def resource_path(filename: str) -> str:
-       """Path to a bundled file, correct both from source and when packaged.
-
-       PyInstaller sets sys._MEIPASS to the folder holding bundled data files
-       (logo.png among them). Running from source, that attribute does not
-       exist, so this falls back to the folder this script lives in.
-       """
-       base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-       return os.path.join(base, filename)
-
-   WHY: logo.png sits next to receiver_gui.py when run from source, but
-   PyInstaller unpacks bundled data files into a different temp/app folder
-   at runtime. Any code loading logo.png by a plain relative path breaks
-   silently (or crashes) once packaged. resource_path() must be used
-   anywhere the app loads logo.png or any other bundled non-Python file.
-   This behaves identically on macOS - no platform branching needed.
-
-3. Set the window icon inside ConfigWindow.__init__, right after
-   self.root.protocol("WM_DELETE_WINDOW", self.on_app_close):
-
-       try:
-           self._icon_image = tk.PhotoImage(file=resource_path("logo.png"))
-           self.root.iconphoto(True, self._icon_image)
-       except tk.TclError as exc:
-           print(f"[receiver_gui] could not set window icon: {exc}")
-
-   WHY: self._icon_image must be stored as an instance attribute, not a
-   local variable - Tk does not hold a strong reference to PhotoImage
-   objects on its own, so a local variable gets garbage-collected as soon
-   as __init__ returns, and the icon silently reverts to blank.
-   On macOS this call is harmless but does NOT control the dock icon -
-   see the macOS icon note below, mobcam_macos.spec's BUNDLE(icon=...)
-   is what actually sets that.
-
-4. Changed main() to pass an explicit Tk className:
-
-   def main():
-       # className sets WM_CLASS, which GNOME matches against a .desktop
-       # file's StartupWMClass to pick the correct dock/taskbar icon.
-       # Without this the window is unidentifiable and GNOME falls back to
-       # a generic icon.
-       root = tk.Tk(className="mobcam")
-       ConfigWindow(root)
-       root.mainloop()
-
-   WHY: See the StartupWMClass note under mobcam.desktop above - both sides
-   of this match are required together, changing only one does nothing.
-   This is a no-op on macOS (WM_CLASS/StartupWMClass is an X11/Linux
-   window-manager concept) - no macOS-specific equivalent is needed here,
-   the dock icon is handled entirely by the .icns bundled into the .app.
-
-
-HOW THE macOS DOCK ICON WORKS (compare to Linux BUG 2 above)
--------------------------------------------------------------
-On Linux, the taskbar/dock icon and the window's own title-bar icon are
-controlled by two separate mechanisms (iconphoto() vs WM_CLASS matching a
-.desktop file), which is why BUG 2 happened there.
-
-On macOS there is only one mechanism: the icon embedded in the .app bundle
-via CFBundleIconFile, which mobcam_macos.spec sets through BUNDLE(icon=
-'packaging/macos/mobcam.icns'). That single icon covers the Dock, Finder,
-Launchpad, and Cmd+Tab switcher all at once. iconphoto() inside
-receiver_gui.py still runs (harmless, low cost, keeps the code identical
-across platforms) but has no visible effect on macOS - it only ever
-touched the in-window title bar icon there, and Tk windows on macOS do not
-draw a title-bar icon at all.
-
-Practical implication: if the .app's Dock icon looks wrong or missing after
-a macOS build, the fix is in mobcam.icns / make_icns.sh / the BUNDLE() icon
-path in mobcam_macos.spec - never in receiver_gui.py.
+Practical implication: if the installed app's icon looks wrong or generic
+after a Windows build, the fix is in mobcam.ico / make_ico.py / the
+EXE(icon=...) path in mobcam_windows.spec, and possibly a stale Windows
+icon cache - never in receiver_gui.py.
 
 
 BUGS WE HIT AND HOW WE DIAGNOSED THEM (Linux)
@@ -642,8 +866,9 @@ BUG 1: Camera preview blank, QR code for WiFi pairing not showing
   Lesson: any crash mentioning a missing PIL/Tk/plugin-style submodule after
   packaging (not before) is almost always a hidden-import problem, not a
   real logic bug - check mobcam.spec's hidden_imports list first. This
-  exact line was added to mobcam_macos.spec up front for this reason - if
-  it ever gets removed by accident, expect this same crash on macOS too.
+  exact line was added to mobcam_macos.spec and mobcam_windows.spec up front
+  for this reason - if it ever gets removed by accident from either, expect
+  this same crash there too.
 
 BUG 2: App window shows the correct icon internally, but taskbar/dock/app
 switcher/GNOME search all show a generic default icon instead of logo.png
@@ -666,8 +891,8 @@ switcher/GNOME search all show a generic default icon instead of logo.png
   Lesson to test this: launch through the desktop entry, not the terminal.
   Terminal launches never show the taskbar-correct icon regardless of any
   code fix, so testing that way looks like a persistent bug when it is not.
-  This bug class does not exist on macOS - see "HOW THE macOS DOCK ICON
-  WORKS" above.
+  This bug class does not exist on macOS or Windows - see the platform icon
+  notes above.
 
 BUG 3: .desktop file silently did not appear in GNOME search at all
   Cause: the Exec= line contained an unquoted path with a space in it
@@ -681,11 +906,15 @@ BUG 3: .desktop file silently did not appear in GNOME search at all
   .desktop file that silently fails to appear anywhere; it will print
   nothing if the file is actually valid, which itself is useful
   confirmation.
-  Worth remembering for macOS too: build_dmg.sh's APP_PATH variable
-  ("$ROOT_DIR/dist/Mob Cam.app") is deliberately quoted end-to-end for the
-  exact same reason - the project folder and the .app name both contain
-  spaces ("Mob Cam" / "Mob Cam.app"), so any unquoted path segment added
-  later to these scripts will break the same way BUG 3 did.
+  Worth remembering for macOS and Windows too: build_dmg.sh's APP_PATH
+  variable ("$ROOT_DIR/dist/Mob Cam.app") and mobcam.iss's Source: line
+  ("..\..\dist\mobcam\*") both deal with a project folder literally named
+  "Mob Cam" - the macOS side is quoted end-to-end for exactly this reason,
+  and Inno Setup's own [Files] syntax handles the space in the path without
+  extra quoting needed, but any NEW unquoted path added later to
+  build_windows.ps1 itself (a plain PowerShell script, not Inno Setup
+  syntax) could break the same way BUG 3 did if it forgets to wrap a path
+  containing a space in quotes.
 
 BUG (ATTEMPTED, CAUGHT BEFORE A REAL BUILD): running build_macos.sh on Linux
   Symptom:
@@ -704,7 +933,22 @@ BUG (ATTEMPTED, CAUGHT BEFORE A REAL BUILD): running build_macos.sh on Linux
   GitHub Actions macos-latest).
   Lesson: check `uname` / the shell prompt before debugging a macOS build
   failure line-by-line - if the machine is not actually macOS, every tool
-  in the chain will fail the same way, and no script change fixes it.
+  in the chain will fail the same way, and no script change fixes it. The
+  same lesson applies to build_windows.ps1 - it is PowerShell and calls
+  pyinstaller/ISCC.exe, neither of which produce a Windows-usable result
+  when run anywhere but Windows itself (or a Windows CI runner).
+
+NOT YET HIT (Windows, anticipated - see STILL TO DO): PIL._tkinter_finder
+was pre-empted in mobcam_windows.spec's hidden_imports, same as macOS, so
+BUG 1 is not expected to reappear. Two things flagged in advance as more
+likely on a first real Windows build, based on how these libraries behave
+differently per OS: pyvirtualcam's backend selection (it auto-picks
+OBS's virtualcam DLL on Windows, which only exists once OBS Studio has been
+installed and launched at least once - a missing-backend error here is a
+setup issue, not a packaging bug) and sounddevice/PortAudio bundling
+(PortAudio ships inside the sounddevice wheel on Windows, unlike Linux
+which needs libportaudio2 from apt, so this is expected to just work, but
+has not been confirmed on real hardware yet).
 
 
 MISTAKE WE MADE AND FIXED: Recommends: v4l2loopback-dkms
@@ -734,10 +978,12 @@ ever mentioned - nothing in the package touches it automatically.
 LESSON: never add a Recommends: or Depends: line for anything the user is
 supposed to install themselves, even if it feels convenient - apt's default
 behavior of auto-installing Recommends will silently break that intent.
-Same rule applies to the macOS side: build_dmg.sh and mobcam_macos.spec
-must never bundle, install, or auto-launch OBS or BlackHole - the .app
-should only ever surface setup instructions on screen, exactly like the
-Linux "Load driver" / "Fix / help" buttons already do.
+Same rule applies to the macOS and Windows sides: build_dmg.sh,
+mobcam_macos.spec, mobcam.iss, and mobcam_windows.spec must never bundle,
+install, or auto-launch OBS, BlackHole, or VB-CABLE - the .app and the
+installer should only ever surface setup instructions on screen, exactly
+like the Linux "Load driver" / "Fix / help" buttons already do. mobcam.iss's
+[Code] section follows this rule as written - see its NOTE above.
 
 
 STEP-BY-STEP: HOW TO REPRODUCE THE LINUX BUILD FROM SCRATCH
@@ -873,6 +1119,90 @@ and notarization are a separate, not-yet-done step; the build above
 produces a correct, testable, but not yet distributable .dmg.
 
 
+STEP-BY-STEP: HOW TO BUILD THE WINDOWS .exe (REQUIRES AN ACTUAL WINDOWS MACHINE)
+-----------------------------------------------------------
+Most of this section only works when run ON Windows - a physical PC, a
+Windows VM, or a Windows CI runner (e.g. GitHub Actions windows-latest).
+PyInstaller does not cross-compile, and ISCC.exe (Inno Setup) is a Windows
+tool with no Linux package or workaround. Do not attempt to run
+build_windows.ps1 from Linux. The ONE exception is step 0 below - the icon
+- which uses only Pillow and has already been generated successfully on
+Megatron (the Linux dev machine).
+
+0. (Can be done ahead of time, on Linux or Windows) Generate the icon:
+     python packaging/windows/make_ico.py
+   Confirmed working - produced packaging/windows/mobcam.ico on Megatron.
+   Carry this file over with the rest of the project folder; build_windows.ps1
+   will skip regenerating it if it already exists.
+
+1. Get the project onto the Windows machine. From Linux:
+     cd ~/Desktop
+     zip -r MobCam-source.zip "Mob Cam" -x "Mob Cam/venv/*" -x "Mob Cam/build/*" -x "Mob Cam/dist/*" -x "Mob Cam/__pycache__/*" -x "Mob Cam/.git/*"
+   Copy MobCam-source.zip to the Windows machine (USB, network share, cloud
+   drive) and unzip it there.
+
+2. Install Inno Setup 6 on the Windows machine, once:
+   https://jrsoftware.org/isdl.php
+   This is a manual GUI install, not scriptable via pip or anything else -
+   ISCC.exe ends up at "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" by
+   default, which build_windows.ps1 falls back to checking if ISCC.exe is
+   not already on PATH.
+
+3. On Windows, in the unzipped project folder, in PowerShell:
+     python -m venv venv
+     venv\Scripts\activate
+     pip install -r requirements.txt
+
+4. Confirm mobcam_windows.spec, build_windows.ps1, and
+   packaging/windows/mobcam.iss exist (full contents above). They are
+   intentionally separate from the Linux/macOS files so a Windows-only
+   change can never break either of those builds.
+
+5. Run the build:
+     .\build_windows.ps1 0.1.0
+   This will:
+     - pip install pyinstaller if missing (requirements-build.txt)
+     - generate packaging/windows/mobcam.ico from logo.png, if it does not
+       already exist (it will already exist if step 0 was done ahead of
+       time on Linux)
+     - run PyInstaller against mobcam_windows.spec, producing
+       dist/mobcam/mobcam.exe
+     - locate ISCC.exe (PATH, then the default install path)
+     - run ISCC against packaging/windows/mobcam.iss with
+       /DMyAppVersion=0.1.0, producing
+       packaging/windows/output/MobCam-Setup-0.1.0.exe
+
+6. TEST before considering it done:
+    - Run dist/mobcam/mobcam.exe directly first (fastest feedback loop,
+      catches most runtime errors before wrapping into the installer). Same
+      lesson as Linux BUG 1: any crash mentioning a missing PIL/Tk submodule
+      means hidden_imports needs an entry in mobcam_windows.spec.
+    - Run MobCam-Setup-0.1.0.exe and actually go through the install wizard
+      (not just check the file exists - the install itself is a real test).
+    - Confirm the post-install MsgBox appears with the OBS/VB-CABLE
+      instructions, and that it never tries to install either automatically
+      - see "MISTAKE WE MADE AND FIXED" above.
+    - Launch Mob Cam from the Start Menu shortcut, not by re-running the exe
+      from dist/, to verify the installed shortcut and icon actually work.
+    - Uninstall via "Add or Remove Programs" to confirm a clean uninstall.
+    - If Windows SmartScreen blocks the installer with an "unrecognized
+      app" warning, that is expected for an unsigned .exe (see CODE SIGNING
+      NOTE below) - not a packaging bug.
+
+7. Copy the finished MobCam-Setup-0.1.0.exe back to Megatron (or wherever
+   the Mob Cam Web project lives), into applicationWindows/, and update the
+   Windows download button href in index.html to the exact filename (it
+   includes the version number, so this step repeats every release, same as
+   the Linux and macOS artifacts).
+
+CODE SIGNING NOTE: without a code signing certificate, Windows SmartScreen
+will show a "Windows protected your PC" warning for anyone who downloads
+and runs the installer - this is the direct Windows equivalent of macOS's
+Gatekeeper warning without notarization, and is expected, not a packaging
+bug. Signing is a separate, not-yet-done step; the build above produces a
+correct, testable, but not yet fully "trusted" installer.
+
+
 STILL TO DO
 -------------
 - macOS packaging: build_macos.sh / mobcam_macos.spec / build_dmg.sh are
@@ -881,16 +1211,24 @@ STILL TO DO
   "done" the way Linux is. Requires Apple Developer signing + notarization
   before public distribution, to avoid Gatekeeper blocking the app outright
   for anyone who downloads it.
+- Windows packaging: mobcam_windows.spec / build_windows.ps1 /
+  packaging/windows/mobcam.iss are written and believed correct, and the
+  icon (packaging/windows/mobcam.ico) has already been generated
+  successfully on Megatron, but the actual PyInstaller + Inno Setup build
+  has NOT yet been run or tested on real Windows hardware - do that pass
+  before treating Windows as "done" the way Linux is. Requires a code
+  signing certificate before public distribution, to avoid SmartScreen
+  blocking the app outright for anyone who downloads it.
 - Consider a GitHub Actions macos-latest workflow to run build_macos.sh in
   CI, so macOS builds do not require owning a Mac - not yet written.
-- Windows packaging: PyInstaller --onedir + Inno Setup installer wrapping
-  it into a proper .exe installer with Start Menu shortcut and uninstaller.
-  Will need a similar "hidden dependency" pass - expect at least the same
-  PIL._tkinter_finder issue to reappear, likely others specific to Windows
-  (e.g. pyvirtualcam's backend selection, sounddevice/PortAudio bundling).
+- Consider a GitHub Actions windows-latest workflow to run build_windows.ps1
+  in CI, so Windows builds do not require owning a Windows machine - not yet
+  written. Same idea as the macOS one above; Windows runners are generally
+  easier to get working than macOS runners since nothing here needs special
+  entitlements the way macOS code signing does.
 - Version bumping is currently fully manual (pass a version string as the
-  build_linux.sh / build_macos.sh argument, and manually rename the
-  download links in index.html each time) - no automated versioning/
-  release pipeline yet.
+  build_linux.sh / build_macos.sh / build_windows.ps1 argument, and manually
+  rename the download links in index.html each time) - no automated
+  versioning/release pipeline yet.
 - No auto-update mechanism in the app itself yet - users must manually
   redownload a new version.

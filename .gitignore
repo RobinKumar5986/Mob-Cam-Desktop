@@ -22,4 +22,6 @@ packaging/linux/output/
 packaging/macos/build/
 packaging/macos/output/
 packaging/macos/mobcam.iconset/
-packaging/macos/mobcam.icns
+packaging/macos/mobcam.icnspackaging/windows/build/
+packaging/windows/output/
+packaging/windows/mobcam.ico
