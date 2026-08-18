@@ -81,6 +81,9 @@ remote_settings.py   Model of the phone's settings received in HELLO.
 
 desktop_settings.py  Persists local UI preferences to ~/.mobcam/settings.json.
 
+adb_tools.py         Resolves the adb binary and caches it. adb_path(),
+                     adb_command(), adb_hint(). Every adb call in the project
+                     must go through adb_command() - never a bare "adb".
 adb_wifi.py          mDNS discovery for wireless adb pairing.
 adb_wifi_dialog.py   QR-code / pairing-code dialog.
 
@@ -167,6 +170,11 @@ RULES THAT MATTER
     the other.
 13. A device probe failure is not a user preference. Never persist a toggle
     that was turned off by a failed probe or a runtime error.
+14. Never shell out to a bare external binary name. A packaged app launched
+    from Finder, a .desktop entry or the Start Menu inherits almost no PATH,
+    so subprocess(["adb", ...]) works from a terminal and fails in the
+    installed app. Go through adb_tools.adb_command() for adb; any new
+    external tool needs the same treatment.
 
 
 SETUP
@@ -177,6 +185,14 @@ python receiver_gui.py
 
 sounddevice needs PortAudio. Bundled on Windows and macOS; on Debian/Ubuntu
 run: sudo apt install libportaudio2
+
+adb must be installed and findable. adb_tools checks PATH, ANDROID_HOME /
+ANDROID_SDK_ROOT, the platform-tools folder under the per-OS default SDK
+location, and the usual package-manager bin folders. Set ADB_PATH to a full
+path if adb lives somewhere unusual.
+  macOS    brew install --cask android-platform-tools, or Android Studio
+  Windows  Android Platform Tools in %LOCALAPPDATA%\Android\Sdk\platform-tools
+  Linux    sudo apt install android-tools-adb
 
 Camera device (loopback driver):
   Windows / macOS  install OBS Studio, launch once
@@ -202,6 +218,14 @@ models/ folder next to the scripts. Inference is fully local.
 
 GOTCHAS THAT COST TIME
 ----------------------
+- A packaged app gets almost no PATH. Symptom: adb devices are found when
+  running from source or from a terminal, and "No devices found" in the
+  installed .app / .deb / Start Menu launch, even while the phone says USB
+  debugging is connected. Cause is FileNotFoundError on the bare "adb"
+  subprocess, swallowed by the except blocks in receiver_gui and adb_wifi.
+  Fix is adb_tools.adb_command() everywhere. To confirm, run the binary
+  inside the bundle from a terminal - if it works there and not on a
+  double-click, it is PATH.
 - modprobe will not change the options of an already loaded module. To add
   exclusive_caps you must modprobe -r first. Symptom: camera works in OBS,
   invisible in Chrome / Meet.
@@ -216,6 +240,13 @@ GOTCHAS THAT COST TIME
   remap-source is what makes it look like a normal microphone.
 - Sound cards usually accept only 44.1 / 48 kHz. audio_output resamples, so
   the phone can stay on 16 kHz.
+- macOS 15+ gates mDNS behind a Local Network permission. Without
+  NSLocalNetworkUsageDescription in the .app's Info.plist the zeroconf browse
+  in adb_wifi silently finds nothing, which looks exactly like the PATH bug
+  above. USB mode is unaffected, since adb forward is loopback only.
+- console=False in the PyInstaller specs means every print() and traceback
+  goes nowhere in a packaged build. Run the binary inside the bundle from a
+  terminal to see stderr.
 
 
 KNOWN OPEN ISSUES
@@ -234,6 +265,8 @@ KNOWN OPEN ISSUES
 - Not yet confirmed whether the pixel format pyvirtualcam opens with is the
   one browsers prefer. If Meet still refuses a correctly loaded device, check
   the fmt argument in virtual_camera.py.
+- No log file yet, so a packaged-build failure gives no output at all.
+  ~/.mobcam/log.txt would make the next PATH-class bug a one-line diagnosis.
 
 
 TESTS

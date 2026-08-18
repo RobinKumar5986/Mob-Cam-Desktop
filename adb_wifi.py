@@ -35,10 +35,13 @@ def random_password():
 
 def run_adb(*args):
     """Run an adb command. Returns (ok, combined_output)."""
+    command = adb_command(*args)
+    if command is None:
+        return False, adb_hint()
     try:
-        out = subprocess.run(["adb", *args], capture_output=True, text=True, timeout=15)
+        out = subprocess.run(command, capture_output=True, text=True, timeout=15)
         return out.returncode == 0, (out.stdout + out.stderr).strip()
-    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+    except (subprocess.TimeoutExpired, OSError) as e:
         return False, str(e)
 
 

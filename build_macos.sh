@@ -10,7 +10,7 @@ OUT_DIR="$ROOT_DIR/packaging/macos/output"
 
 echo "==> Building Mob Cam v$VERSION for macOS"
 
-pip install --quiet -r requirements-build.txt
+python3 -m pip install --quiet -r requirements-build.txt
 
 if [ ! -f "$ROOT_DIR/packaging/macos/mobcam.icns" ]; then
   echo "==> No icon found, generating one from logo.png"
@@ -22,7 +22,7 @@ sed -i '' "s/'CFBundleShortVersionString': '[^']*'/'CFBundleShortVersionString':
   "$ROOT_DIR/mobcam_macos.spec"
 
 rm -rf "$ROOT_DIR/build" "$ROOT_DIR/dist"
-pyinstaller "$ROOT_DIR/mobcam_macos.spec" --noconfirm
+python3 -m PyInstaller "$ROOT_DIR/mobcam_macos.spec" --noconfirm
 
 mkdir -p "$OUT_DIR"
 bash "$ROOT_DIR/packaging/macos/build_dmg.sh" "$VERSION" "$ROOT_DIR" "$OUT_DIR"

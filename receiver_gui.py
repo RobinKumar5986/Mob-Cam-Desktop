@@ -40,6 +40,7 @@ from stream_pipeline import StreamPipeline
 import virtual_mic
 from audio_processing import MAX_GAIN_DB, MIN_GAIN_DB
 from virtual_camera import current_os, probe, setup_instructions
+from adb_tools import adb_command, adb_hint, adb_path
 
 PORT = DEFAULT_PORT
 AUDIO_STREAM_PORT = AUDIO_PORT
@@ -270,22 +271,32 @@ def model_label(key):
     return SEGMENTER_MODELS[0][0]
 
 
+
+
 def run_adb(*args):
     """Run an adb command, tolerating adb not being installed."""
-    try:
-        return subprocess.run(["adb", *args], capture_output=True)
-    except (FileNotFoundError, OSError) as exc:
-        print(f"[receiver_gui] adb unavailable: {exc}")
+    command = adb_command(*args)
+    if command is None:
+        print("[receiver_gui] adb not found on PATH or in any known SDK location")
         return None
+    try:
+        return subprocess.run(command, capture_output=True)
+    except OSError as exc:
+        print(f"[receiver_gui] adb failed: {exc}")
+        return None
+    
 
 
 def list_adb_devices():
     """Return (serial, model) tuples for connected, authorized devices."""
+    command = adb_command("devices", "-l")
+    if command is None:
+        return []
     try:
         output = subprocess.check_output(
-            ["adb", "devices", "-l"], stderr=subprocess.STDOUT, text=True
+            command, stderr=subprocess.STDOUT, text=True
         )
-    except (subprocess.CalledProcessError, FileNotFoundError):
+    except (subprocess.CalledProcessError, OSError):
         return []
 
     devices = []
@@ -298,7 +309,6 @@ def list_adb_devices():
         model = next((p.split(":")[1] for p in parts if p.startswith("model:")), "")
         devices.append((serial, model or serial))
     return devices
-
 
 class ConfigWindow:
     def __init__(self, root):
@@ -978,14 +988,21 @@ class ConfigWindow:
         threading.Thread(target=self._prefetch_worker, daemon=True).start()
 
     def _prefetch_worker(self):
-        keys = (self.selected_segmenter(), "face_detector")
-        missing = ai_processing.missing_models(keys)
-        if missing:
-            # Only ever shown when something actually has to be fetched.
-            self.root.after(0, lambda: self._open_download_window(missing))
-        ai_processing.prefetch_models(
-            keys, on_status=self._on_ai_status, on_progress=self._on_model_progress)
-        self.root.after(0, self._close_download_window)
+        try:
+            keys = tuple(k for k in (self.selected_segmenter(),
+                                     ai_processing.face_model_key()) if k)
+            missing = ai_processing.missing_models(keys)
+            if missing:
+                # Only ever shown when something actually has to be fetched.
+                self.root.after(0, lambda: self._open_download_window(missing))
+            ai_processing.prefetch_models(
+                keys, on_status=self._on_ai_status,
+                on_progress=self._on_model_progress)
+        except Exception as exc:  # noqa: BLE001
+            message = f"model check failed: {exc}"
+            self.root.after(0, lambda: self.ai_status_var.set(message))
+        finally:
+            self.root.after(0, self._close_download_window)
 
     def _open_download_window(self, missing):
         if self._download_window is not None:
@@ -1016,6 +1033,13 @@ class ConfigWindow:
 
     def refresh_devices(self):
         """Re-list adb devices and select the first one."""
+        if adb_path() is None:
+            self.device_combo["values"] = []
+            self.device_var.set("")
+            self._devices = []
+            self.status_var.set("adb not found - see 'Start ADB / find phone'")
+            return
+
         devices = list_adb_devices()
         if not devices:
             self.device_combo["values"] = []
@@ -1031,7 +1055,6 @@ class ConfigWindow:
             (i for i, (serial, _) in enumerate(devices) if serial == remembered), 0)
         self.device_combo.current(index)
         self.status_var.set(f"{len(devices)} device(s) found")
-
     def get_selected_serial(self):
         idx = self.device_combo.current()
         if idx < 0 or not self._devices:
@@ -1039,6 +1062,10 @@ class ConfigWindow:
         return self._devices[idx][0]
 
     def connect_adb(self):
+        if adb_path() is None:
+            self.status_var.set("adb not found")
+            HelpWindow(self.root, "adb not found", adb_hint())
+            return
         self.status_var.set("Starting ADB and scanning for devices...")
         threading.Thread(target=self._connect_adb_worker, daemon=True).start()
 
@@ -1103,22 +1130,25 @@ class ConfigWindow:
             messagebox.showwarning("No device", "Select a device first.")
             return
 
+        forward = adb_command("-s", serial, "forward", f"tcp:{PORT}", f"tcp:{PORT}")
+        if forward is None:
+            HelpWindow(self.root, "adb not found", adb_hint())
+            return
         try:
-            subprocess.check_call(
-                ["adb", "-s", serial, "forward", f"tcp:{PORT}", f"tcp:{PORT}"])
-        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            subprocess.check_call(forward)
+        except (subprocess.CalledProcessError, OSError) as e:
             messagebox.showerror("adb forward failed", str(e))
             return
 
         # Audio has its own socket. A failure here is not fatal: video still
         # works, the mic simply never connects.
         if self.audio_var.get():
+            audio_forward = adb_command(
+                "-s", serial, "forward",
+                f"tcp:{AUDIO_STREAM_PORT}", f"tcp:{AUDIO_STREAM_PORT}")
             try:
-                subprocess.check_call([
-                    "adb", "-s", serial, "forward",
-                    f"tcp:{AUDIO_STREAM_PORT}", f"tcp:{AUDIO_STREAM_PORT}",
-                ])
-            except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                subprocess.check_call(audio_forward)
+            except (subprocess.CalledProcessError, OSError) as e:
                 self.audio_status_var.set(f"Audio port forward failed: {e}")
 
         try:
