@@ -1,8 +1,8 @@
-numpy
-opencv-python
-pillow
-pyvirtualcam
-sounddevice
-mediapipe
-qrcode
-zeroconf
+numpy>=1.26,<2.5
+opencv-contrib-python>=4.8,<5
+pillow>=10.0
+pyvirtualcam>=0.11
+sounddevice>=0.4.6
+mediapipe>=0.10.9
+qrcode>=7.4
+zeroconf>=0.131
